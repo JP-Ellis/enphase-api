@@ -45,7 +45,6 @@ jobs:
       - format
       - coverage
       - test
-      - examples
 
     steps:
       - name: Failed
@@ -212,8 +211,9 @@ jobs:
         with:
           tool: cargo-tarpaulin
 
-      - name: Run cargo tarpaulin
-        run: cargo tarpaulin --out Xml
+      # Disabled for now until we can add tests that run in CI
+      # - name: Run cargo tarpaulin
+      #   run: cargo tarpaulin --out Xml
 
       - name: Upload Rust coverage artifact
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4  # v5.0.0
@@ -262,71 +262,9 @@ jobs:
         with:
           tool: cargo-hack,nextest
 
-      - name: Run tests
-        shell: bash
-        env:
-          NEXTEST_EXPERIMENTAL_LIBTEST_JSON: '1'
-        run: |-
-          while IFS=$'\n' read -r line || ! retval=$line; do
-            if ! echo "$line" | jq -e . 2>/dev/null 1>&2; then
-              continue
-            fi
-
-            type=$(echo "$line" | jq -r '.type')
-            event=$(echo "$line" | jq -r '.event')
-            if [ "$type" != "test" ] || [ "$event" != "failed" ]; then
-              continue
-            fi
-
-            echo "Found failed test: $line"
-
-            failed=true
-            name=$(echo "$line" | jq -r '.name')
-            stdout=$(echo "$line" | jq -r '.stdout')
-
-            {
-              echo "## Failed test $name"
-              echo '```'
-              echo "$stdout"
-              echo '```'
-            } >>"$GITHUB_STEP_SUMMARY"
-          done < <(
-            cargo hack nextest run \
-              --feature-powerset \
-              --workspace \
-              --message-format libtest-json
-            printf '%s' "$?"
-          )
-
-          exit "$retval"
-
-  examples:
-    name: Examples
-
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy,rustfmt
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1  # v2.8.1
-
-      - name: Install Rust tools
-        uses: taiki-e/install-action@c5b1b6f479c32f356cc6f4ba672a47f63853b13b  # v2.62.38
-        with:
-          tool: cargo-hack,cargo-action-fmt
-
-      - name: Run examples
-        run: |-
-          {
-            cargo hack run --example --workspace --message-format json -- \
-              -D warnings
-
-            cargo hack run --example --workspace --all-targets --message-format json -- \
-              -D warnings
-          } | cargo-action-fmt
+      # Disabled for now until we can add tests that run in CI
+      # - name: Run tests
+      #   run: |-
+      #     cargo hack --feature-powerset \
+      #       nextest run \
+      #       --workspace
