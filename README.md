@@ -1,15 +1,6 @@
 # Enphase API
 
 <!-- markdownlint-disable no-inline-html -->
-<div align="center">
-    <img src="logo.svg" alt="Enphase API Logo" height="200" align="left" hspace="20">
-    <span>
-        <b>
-            A Rust client library for the Enphase/Envoy API, providing easy access to local solar energy data.
-        </b>
-    </span>
-</div>
-
 <div align="center"><table>
     <tr>
         <td>Package</td>
@@ -71,6 +62,12 @@
 </table></div>
 <!-- markdownlint-enable no-inline-html -->
 
+A Rust client library for interacting with Enphase solar systems via the Entrez cloud service and local Envoy gateway.
+
+> [!NOTE]
+>
+> This library is in early development. Currently, only authentication and basic power control are implemented. Additional API endpoints will be added over time. **Contributions are very welcome!**
+
 ## Installation
 
 Add this to your `Cargo.toml`:
@@ -83,58 +80,71 @@ enphase-api = "~1"
 ## Quick Start
 
 ```rust
-use enphase_api::Enphase;
+use enphase_api::{Entrez, Envoy, PowerState};
 
-// Create a client
-let client = Enphase::builder()
-    .host("envoy.local") // Your Envoy gateway address
-    .build()?;
+// Step 1: Authenticate with Enphase Entrez and get a JWT token
+let entrez = Entrez::default();
+entrez.login("your-email@example.com", "your-password")?;
+let token = entrez.generate_token("your-site-name", "your-envoy-serial", true)?;
 
-// Get production data
-let production = client.production()?;
-println!("Current production: {} W", production.watts_now);
+// Step 2: Connect to your local Envoy gateway
+let envoy = Envoy::new("envoy.local");
+envoy.authenticate(&token)?;
+
+// Step 3: Control your system (example: set power state)
+envoy.set_power_state("device-serial-number", PowerState::On)?;
 ```
 
-## Authentication
+The library supports Enphase's two-step authentication:
 
-You'll need to configure your Envoy gateway address. Authentication methods vary by Envoy model:
+1.  **Entrez Cloud Service**: Authenticate with your Enphase account to generate JWT tokens
+2.  **Local Envoy Gateway**: Use the JWT token to access your local Envoy device
 
-### Basic Configuration
+The client then remembers the authentication state for subsequent API calls. Note that the JWT token has a limited lifespan and re-authentication may be necessary.
+
+### Using Environment Variables
+
+For convenience, you can use environment variables for authentication:
 
 ```rust
-let client = Enphase::builder()
-    .host("envoy.local") // or IP address like "192.168.1.100"
-    .build()?;
+use enphase_api::{Entrez, Envoy};
+
+// Set these environment variables:
+// - ENTREZ_USERNAME
+// - ENTREZ_PASSWORD
+let entrez = Entrez::default();
+entrez.login_with_env()?;
+
+let token = entrez.generate_token("your-site-name", "your-envoy-serial", true)?;
+
+let envoy = Envoy::new("envoy.local"); // or use IP address like "192.168.1.100"
+envoy.authenticate(&token)?;
 ```
 
-### With Authentication (if required)
+## Current API Coverage
 
-```rust
-let client = Enphase::builder()
-    .host("envoy.local")
-    .username("envoy")
-    .password("your-password")
-    .build()?;
-```
+This library is in early development. Currently implemented:
 
-## Examples
+### Entrez Client
 
-Check out the [examples directory](./examples/) for comprehensive usage examples. You can run them directly using Cargo and they will demonstrate various API features:
+-   User authentication ([`login`](src/client/entrez.rs), [`login_with_env`](src/client/entrez.rs))
+-   JWT token generation for Envoy devices ([`generate_token`](src/client/entrez.rs))
 
-```bash
-cargo run --example production
-```
+### Envoy Client
 
-## API Coverage
+-   JWT authentication ([`authenticate`](src/client/envoy.rs))
+-   Power state control ([`set_power_state`](src/client/envoy.rs))
 
-This library provides access to:
+### Planned Features
+
+The following features are planned for future releases:
 
 -   **Production API**: Real-time solar production data
 -   **Consumption API**: Energy consumption monitoring
 -   **Inverter API**: Individual inverter performance data
 -   **System API**: Overall system information and status
 
-For detailed API documentation, visit the [Enphase Developer Portal](https://developer.enphase.com/).
+**We welcome contributions!** If you need a specific API endpoint, please consider opening an issue or submitting a pull request.
 
 ## Documentation
 
@@ -144,23 +154,28 @@ For detailed API documentation, visit the [Enphase Developer Portal](https://dev
 
 ## Contributing
 
-We welcome contributions! Please see our [Contributing Guide](./CONTRIBUTING.md) for details on:
+We welcome contributions! This library is in active development and there are many API endpoints still to implement. Please see our [Contributing Guide](./CONTRIBUTING.md) for details on:
 
 -   Setting up the development environment
 -   Running tests and examples
 -   Code style and formatting guidelines
 -   Submitting pull requests
 
+If you'd like to add support for additional API endpoints, please feel free to open an issue or submit a pull request!
+
 ## Testing
 
 Run the test suite:
 
 ```bash
+# Run unit tests
+cargo test
+
 # Run tests with nextest (faster)
 cargo nextest run
 
-# Run integration tests
-cargo test --test integration
+# Run integration tests (requires credentials)
+cargo test --test integration -- --ignored
 ```
 
 ## License
