@@ -16,7 +16,10 @@
 
 use core::fmt::Display;
 
-use crate::{error::Result, models::PowerState};
+use crate::{
+    error::Result,
+    models::{PowerState, PowerStatusResponse},
+};
 use tracing::{debug, instrument};
 
 /// Main client for the Enphase Envoy local gateway
@@ -181,7 +184,7 @@ impl Envoy {
     /// # Example
     ///
     /// ```no_run
-    /// use enphase_api::{Envoy, PowerState};
+    /// use enphase_api::{Envoy, models::PowerState};
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let client = Envoy::new("envoy.local");
@@ -222,5 +225,61 @@ impl Envoy {
             "Failed to set power state: HTTP {}",
             response.status()
         )))
+    }
+
+    /// Get the power state of an inverter or device.
+    ///
+    /// This retrieves the current power state from the Envoy device for the
+    /// specified device (identified by serial number).
+    ///
+    /// # Arguments
+    ///
+    /// * `serial` - The serial number of the device to query
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(true)` if power is on, `Ok(false)` if power is off.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use enphase_api::Envoy;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = Envoy::new("envoy.local");
+    /// let is_on = client.get_power_state("603980032")?;
+    /// println!("Power is {}", if is_on { "on" } else { "off" });
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    #[instrument(skip(self, serial), level = "debug")]
+    #[expect(clippy::cognitive_complexity, reason = "Instrumentation macro")]
+    pub fn get_power_state(&self, serial: impl Display) -> Result<bool> {
+        debug!("Getting power state");
+
+        let endpoint = format!("{}/ivp/mod/{}/mode/power", self.base_url, serial);
+        debug!("GET {endpoint}");
+
+        let mut response = self
+            .agent
+            .get(&endpoint)
+            .header("Accept", "application/json, text/javascript, */*; q=0.01")
+            .call()?;
+
+        debug!("Status code: {}", response.status());
+
+        let body = response.body_mut().read_to_string()?;
+        debug!("Response body: {}", body);
+
+        let status: PowerStatusResponse = serde_json::from_str(&body)?;
+        debug!(?status, "Parsed power status");
+
+        // powerForcedOff: true means power is OFF, so we invert it
+        Ok(!status.power_forced_off)
     }
 }

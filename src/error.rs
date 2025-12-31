@@ -26,6 +26,10 @@ pub enum EnphaseError {
     /// I/O error
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
+
+    /// JSON parsing error
+    #[error("JSON parsing error: {0}")]
+    JsonError(#[from] serde_json::Error),
 }
 
 /// Result type for Enphase API operations
