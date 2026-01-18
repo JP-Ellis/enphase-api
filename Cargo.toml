@@ -34,7 +34,7 @@ ureq = { version = "~3", default-features = false, features = [
 
 [dev-dependencies]
 anyhow            = "=1.0.100"
-insta             = "=1.43.2"
+insta             = "=1.46.1"
 pretty_assertions = "=1.4.1"
 rstest            = "=0.26.1"
 
