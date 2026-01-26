@@ -1,7 +1,8 @@
 //! # Enphase Entrez Cloud Service Client
 //!
-//! This module provides a client for interacting with the Enphase Entrez service,
-//! which is used to manage authentication and generate JWT tokens for Envoy devices.
+//! This module provides a client for interacting with the Enphase Entrez
+//! service, which is used to manage authentication and generate JWT tokens for
+//! Envoy devices.
 //!
 //! The Entrez service is a cloud-based service that provides:
 //! - User authentication
@@ -18,10 +19,10 @@ const DEFAULT_ENTREZ_URL: &str = "https://entrez.enphaseenergy.com";
 ///
 /// This client provides authentication and token generation for accessing
 /// Envoy devices via JWT tokens.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Entrez {
-    /// HTTP agent for making requests.
-    agent: ureq::Agent,
+    /// HTTP client for making requests.
+    client: reqwest::Client,
     /// Base URL for the Entrez service.
     base_url: String,
 }
@@ -53,40 +54,57 @@ impl Entrez {
     /// ```no_run
     /// use enphase_api::Entrez;
     ///
+    /// # #[tokio::main]
+    /// # async fn main() {
     /// let client = Entrez::new("https://entrez.enphaseenergy.com");
+    /// # }
     /// ```
     #[inline]
+    #[expect(
+        clippy::missing_panics_doc,
+        clippy::expect_used,
+        reason = "reqwest::Client::builder() with basic config cannot fail"
+    )]
     pub fn new(url: impl Into<String>) -> Self {
         let base_url = url.into();
 
-        Self {
-            agent: ureq::agent(),
-            base_url,
-        }
+        let client = reqwest::Client::builder()
+            .user_agent(format!("enphase-api/{}", env!("CARGO_PKG_VERSION")))
+            .cookie_store(true)
+            .timeout(core::time::Duration::from_secs(30))
+            .build()
+            .expect("Failed to build HTTP client");
+
+        Self { client, base_url }
     }
 
-    /// Create a new Entrez client with the given URL and agent.
+    /// Create a new Entrez client with the given URL and HTTP client.
     ///
-    /// This allows you to provide a custom `ureq::Agent` with specific configuration.
+    /// This allows you to provide a custom `reqwest::Client` with specific
+    /// configuration.
     ///
     /// # Arguments
     ///
     /// * `url` - The base URL of the Entrez service
-    /// * `agent` - A configured `ureq::Agent`
+    /// * `client` - A configured `reqwest::Client`. The client should have
+    ///   cookie storage enabled to maintain session state.
     ///
     /// # Example
     ///
     /// ```no_run
     /// use enphase_api::Entrez;
     ///
-    /// let agent = ureq::agent();
-    /// let client = Entrez::with_agent("https://entrez.enphaseenergy.com", agent);
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let client = reqwest::Client::new();
+    /// let entrez = Entrez::with_client("https://entrez.enphaseenergy.com", client);
+    /// # }
     /// ```
     #[inline]
-    pub fn with_agent(url: impl Into<String>, agent: ureq::Agent) -> Self {
+    pub fn with_client(url: impl Into<String>, client: reqwest::Client) -> Self {
         let base_url = url.into();
 
-        Self { agent, base_url }
+        Self { client, base_url }
     }
 
     /// Log in to the Enphase Entrez service.
@@ -105,26 +123,30 @@ impl Entrez {
     ///
     /// # Errors
     ///
-    /// Returns an error if the login fails due to invalid credentials or network issues.
+    /// Returns an error if the login fails due to invalid credentials or
+    /// network issues.
     ///
     /// # Example
     ///
     /// ```no_run
     /// use enphase_api::Entrez;
     ///
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let client = Entrez::default();
-    /// client.login("user@example.com", "password")?;
+    /// client.login("user@example.com", "password").await?;
     /// # Ok(())
     /// # }
     /// ```
     #[inline]
-    #[expect(clippy::cognitive_complexity, reason = "Instrumentation macro")]
     #[instrument(skip(self, username, password), level = "debug")]
-    pub fn login(&self, username: impl AsRef<str>, password: impl AsRef<str>) -> Result<()> {
+    pub async fn login(&self, username: impl AsRef<str>, password: impl AsRef<str>) -> Result<()> {
         let username_str = username.as_ref();
         let password_str = password.as_ref();
         debug!("Logging in to Enphase Entrez with {}", username_str);
+
+        let endpoint = format!("{}{}", self.base_url, "/login");
+        debug!("POST {endpoint}");
 
         let form_data = [
             ("username", username_str),
@@ -132,10 +154,7 @@ impl Entrez {
             ("authFlow", "entrezSession"),
         ];
 
-        let endpoint = format!("{}{}", self.base_url, "/login");
-        debug!("POST {endpoint}");
-
-        let response = self.agent.post(&endpoint).send_form(form_data)?;
+        let response = self.client.post(&endpoint).form(&form_data).send().await?;
         debug!("Status code: {}", response.status());
 
         Ok(())
@@ -154,7 +173,8 @@ impl Entrez {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The `ENTREZ_USERNAME` or `ENTREZ_PASSWORD` environment variables are not set
+    /// - The `ENTREZ_USERNAME` or `ENTREZ_PASSWORD` environment variables are
+    ///   not set
     /// - The login fails due to invalid credentials or network issues
     ///
     /// # Example
@@ -162,15 +182,16 @@ impl Entrez {
     /// ```no_run
     /// use enphase_api::Entrez;
     ///
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// // Set ENTREZ_USERNAME and ENTREZ_PASSWORD environment variables
     /// let client = Entrez::default();
-    /// client.login_with_env()?;
+    /// client.login_with_env().await?;
     /// # Ok(())
     /// # }
     /// ```
     #[inline]
-    pub fn login_with_env(&self) -> Result<()> {
+    pub async fn login_with_env(&self) -> Result<()> {
         let username = std::env::var("ENTREZ_USERNAME").map_err(|_e| {
             crate::error::EnphaseError::ConfigurationError(
                 "ENTREZ_USERNAME environment variable not set".to_owned(),
@@ -183,7 +204,7 @@ impl Entrez {
             )
         })?;
 
-        self.login(username, password)
+        self.login(username, password).await
     }
 
     /// Generate a JWT token for accessing an Envoy device.
@@ -195,7 +216,8 @@ impl Entrez {
     ///
     /// * `site_name` - The name of the site
     /// * `serial_number` - The serial number of the Envoy device
-    /// * `commissioned` - Whether the device is commissioned (`true`) or not (`false`)
+    /// * `commissioned` - Whether the device is commissioned (`true`) or not
+    ///   (`false`)
     ///
     /// # Returns
     ///
@@ -213,19 +235,19 @@ impl Entrez {
     /// ```no_run
     /// use enphase_api::Entrez;
     ///
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let client = Entrez::default();
-    /// client.login("user@example.com", "password")?;
+    /// client.login("user@example.com", "password").await?;
     ///
-    /// let token = client.generate_token("My Site", "121212121212", true)?;
+    /// let token = client.generate_token("My Site", "121212121212", true).await?;
     /// println!("Token: {}", token);
     /// # Ok(())
     /// # }
     /// ```
     #[inline]
-    #[expect(clippy::cognitive_complexity, reason = "Parsing HTML response")]
     #[instrument(skip(self, site_name, serial_number, commissioned), level = "debug")]
-    pub fn generate_token(
+    pub async fn generate_token(
         &self,
         site_name: impl AsRef<str>,
         serial_number: impl AsRef<str>,
@@ -250,11 +272,11 @@ impl Entrez {
             ("serialNum", serial_number_str),
         ];
 
-        let mut response = self.agent.post(&endpoint).send_form(form_data)?;
+        let response = self.client.post(&endpoint).form(&form_data).send().await?;
         debug!("Status code: {}", response.status());
 
         // Read response as plain text to parse HTML
-        let response_text = response.body_mut().read_to_string()?;
+        let response_text = response.text().await?;
 
         // Parse the response HTML to extract the token
         // Look for the textarea with id="JWTToken"

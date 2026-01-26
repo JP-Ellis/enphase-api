@@ -13,17 +13,19 @@ fn has_credentials() -> Result<(), Box<dyn core::error::Error>> {
     Ok(())
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "Requires Enphase credentials"]
-fn login_and_generate_token() -> Result<(), Box<dyn core::error::Error>> {
+async fn login_and_generate_token() -> Result<(), Box<dyn core::error::Error>> {
     has_credentials()?;
 
     let site_name = std::env::var("ENVOY_NAME")?;
     let serial_number = std::env::var("ENVOY_SERIAL_NUMBER")?;
     let client = Entrez::default();
 
-    client.login_with_env()?;
-    let token = client.generate_token(&site_name, &serial_number, true)?;
+    client.login_with_env().await?;
+    let token = client
+        .generate_token(&site_name, &serial_number, true)
+        .await?;
     println!("Generated token: {token}");
 
     Ok(())
