@@ -16,9 +16,9 @@ fn has_credentials() -> Result<(), Box<dyn core::error::Error>> {
     Ok(())
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "Requires local Envoy device and Enphase credentials"]
-fn authenticate_and_set_power_state() -> Result<(), Box<dyn core::error::Error>> {
+async fn authenticate_and_set_power_state() -> Result<(), Box<dyn core::error::Error>> {
     has_credentials()?;
 
     // Get credentials from environment
@@ -28,25 +28,27 @@ fn authenticate_and_set_power_state() -> Result<(), Box<dyn core::error::Error>>
 
     // Step 1: Create Entrez client and generate JWT token
     let entrez = Entrez::default();
-    entrez.login_with_env()?;
-    let token = entrez.generate_token(&envoy_name, &envoy_serial, true)?;
+    entrez.login_with_env().await?;
+    let token = entrez
+        .generate_token(&envoy_name, &envoy_serial, true)
+        .await?;
     println!("Generated JWT token for authentication");
 
     // Step 2: Create Envoy client and authenticate with the token
     let envoy = Envoy::new(&envoy_host);
-    envoy.authenticate(&token)?;
+    envoy.authenticate(&token).await?;
     println!("Successfully authenticated with Envoy device");
 
     // Step 3: Set power production to On
-    envoy.set_power_state("603980032", PowerState::On)?;
+    envoy.set_power_state("603980032", PowerState::On).await?;
     println!("Successfully set power state to On");
 
     Ok(())
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "Requires local Envoy device and Enphase credentials"]
-fn authenticate_and_get_power_state() -> Result<(), Box<dyn core::error::Error>> {
+async fn authenticate_and_get_power_state() -> Result<(), Box<dyn core::error::Error>> {
     has_credentials()?;
 
     // Get credentials from environment
@@ -56,17 +58,19 @@ fn authenticate_and_get_power_state() -> Result<(), Box<dyn core::error::Error>>
 
     // Step 1: Create Entrez client and generate JWT token
     let entrez = Entrez::default();
-    entrez.login_with_env()?;
-    let token = entrez.generate_token(&envoy_name, &envoy_serial, true)?;
+    entrez.login_with_env().await?;
+    let token = entrez
+        .generate_token(&envoy_name, &envoy_serial, true)
+        .await?;
     println!("Generated JWT token for authentication");
 
     // Step 2: Create Envoy client and authenticate with the token
     let envoy = Envoy::new(&envoy_host);
-    envoy.authenticate(&token)?;
+    envoy.authenticate(&token).await?;
     println!("Successfully authenticated with Envoy device");
 
     // Step 3: Get current power state
-    let is_on = envoy.get_power_state("603980032")?;
+    let is_on = envoy.get_power_state("603980032").await?;
     println!("Power is {}", if is_on { "on" } else { "off" });
 
     // Verify the response is a valid boolean

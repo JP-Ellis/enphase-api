@@ -26,10 +26,10 @@ use tracing::{debug, instrument};
 ///
 /// This client provides access to local solar production, consumption, and inverter data.
 /// It handles session management and authentication with the Envoy device.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Envoy {
-    /// HTTP agent for making requests.
-    agent: ureq::Agent,
+    /// HTTP client for making requests.
+    client: reqwest::Client,
     /// Base URL for the Envoy gateway.
     base_url: String,
 }
@@ -56,47 +56,56 @@ impl Envoy {
     /// let client = Envoy::new("envoy.local");
     /// ```
     #[inline]
+    #[expect(
+        clippy::missing_panics_doc,
+        clippy::expect_used,
+        reason = "reqwest::Client::builder() with basic config cannot fail"
+    )]
     pub fn new(host: impl Display) -> Self {
         let base_url = format!("https://{host}");
 
-        let agent = ureq::Agent::config_builder()
-            .tls_config(
-                ureq::tls::TlsConfig::builder()
-                    .disable_verification(true)
-                    .build(),
-            )
+        let client = reqwest::Client::builder()
+            .user_agent(format!("enphase-api/{}", env!("CARGO_PKG_VERSION")))
+            .cookie_store(true)
+            .timeout(core::time::Duration::from_secs(30))
+            .danger_accept_invalid_certs(true)
             .build()
-            .new_agent();
+            .expect("Failed to build HTTP client");
 
-        Self { agent, base_url }
+        Self { client, base_url }
     }
 
-    /// Create a new Envoy client with the given host and agent.
+    /// Create a new Envoy client with the given host and HTTP client.
     ///
-    /// This allows you to provide a custom `ureq::Agent` with specific
+    /// This allows you to provide a custom `reqwest::Client` with specific
     /// configuration.
     ///
     /// Since the Envoy client uses self-signed certificates, ensure that the
-    /// provided agent is configured to accept them if necessary.
+    /// provided client is configured to accept them if necessary (or ignore
+    /// certificate errors).
+    ///
+    /// Additionally, the Envoy client requires cookie storage to maintain
+    /// session state, so ensure that the provided client has cookie store
+    /// enabled.
     ///
     /// # Arguments
     ///
     /// * `host` - The hostname or IP address of the Envoy device
-    /// * `agent` - A configured `ureq::Agent`
+    /// * `client` - A configured `reqwest::Client`
     ///
     /// # Example
     ///
     /// ```no_run
     /// use enphase_api::Envoy;
     ///
-    /// let agent = ureq::agent();
-    /// let client = Envoy::with_agent("envoy.local", agent);
+    /// let client = reqwest::Client::new();
+    /// let envoy = Envoy::with_client("envoy.local", client);
     /// ```
     #[inline]
-    pub fn with_agent(host: impl Display, agent: ureq::Agent) -> Self {
+    pub fn with_client(host: impl Display, client: reqwest::Client) -> Self {
         let base_url = format!("https://{host}");
 
-        Self { agent, base_url }
+        Self { client, base_url }
     }
 
     /// Authenticate with the Envoy device using a JWT token.
@@ -122,34 +131,37 @@ impl Envoy {
     /// ```no_run
     /// use enphase_api::{Envoy, Entrez};
     ///
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let entrez = Entrez::default();
-    /// entrez.login_with_env()?;
-    /// let token = entrez.generate_token("your-site-name", "your-envoy-serial-number", true)?;
+    /// entrez.login_with_env().await?;
+    /// let token = entrez.generate_token("your-site-name", "your-envoy-serial-number", true).await?;
     /// let client = Envoy::new("envoy.local");
-    /// client.authenticate(&token)?;
+    /// client.authenticate(&token).await?;
     /// # Ok(())
     /// # }
     /// ```
     #[inline]
-    #[expect(clippy::cognitive_complexity, reason = "Instrumentation macro")]
     #[instrument(skip(self, token), level = "debug")]
-    pub fn authenticate(&self, token: impl Display) -> Result<()> {
+    pub async fn authenticate(&self, token: impl Display) -> Result<()> {
         debug!("Authenticating Envoy via JWT");
 
         let endpoint = format!("{}/auth/check_jwt", self.base_url);
         debug!("GET {endpoint}");
 
-        let mut response = self
-            .agent
+        let response = self
+            .client
             .get(&endpoint)
-            .header("Authorization", format!("Bearer {token}"))
-            .call()?;
-        debug!("Status code: {}", response.status());
+            .bearer_auth(token.to_string())
+            .send()
+            .await?;
 
-        let body = response.body_mut().read_to_string()?;
+        let status = response.status();
+        debug!("Status code: {}", status);
 
-        if response.status() == 200 && body.contains("Valid token") {
+        let body = response.text().await?;
+
+        if status == 200 && body.contains("Valid token") {
             debug!("JWT accepted");
             return Ok(());
         }
@@ -179,23 +191,24 @@ impl Envoy {
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or the device does not respond correctly.
+    /// Returns an error if the request fails or the device does not respond
+    /// correctly.
     ///
     /// # Example
     ///
     /// ```no_run
     /// use enphase_api::{Envoy, models::PowerState};
     ///
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let client = Envoy::new("envoy.local");
-    /// client.set_power_state("603980032", PowerState::Off)?;
+    /// client.set_power_state("603980032", PowerState::Off).await?;
     /// # Ok(())
     /// # }
     /// ```
     #[inline]
     #[instrument(skip(self, serial, state), level = "debug")]
-    #[expect(clippy::cognitive_complexity, reason = "Parsing response")]
-    pub fn set_power_state(&self, serial: impl Display, state: PowerState) -> Result<()> {
+    pub async fn set_power_state(&self, serial: impl Display, state: PowerState) -> Result<()> {
         debug!(?state, "Setting power state");
 
         let endpoint = format!("{}/ivp/mod/{}/mode/power", self.base_url, serial);
@@ -205,25 +218,29 @@ impl Envoy {
         let payload = format!(r#"{{"length":1,"arr":[{}]}}"#, state.payload_value());
 
         let response = self
-            .agent
+            .client
             .put(&endpoint)
             .header(
                 "Content-Type",
+                // This is not an error. Envoy expects the x-www-form-urlencoded
+                // content type, while the body is actually JSON.
                 "application/x-www-form-urlencoded; charset=UTF-8",
             )
-            .send(payload)?;
+            .body(payload)
+            .send()
+            .await?;
 
-        debug!("Status code: {}", response.status());
+        let status = response.status();
+        debug!("Status code: {}", status);
 
         // The endpoint returns 204 No Content on success
-        if response.status() == 204 {
+        if status == 204 {
             debug!("Power state set successfully");
             return Ok(());
         }
 
         Err(crate::error::EnphaseError::InvalidResponse(format!(
-            "Failed to set power state: HTTP {}",
-            response.status()
+            "Failed to set power state: HTTP {status}"
         )))
     }
 
@@ -249,31 +266,33 @@ impl Envoy {
     /// ```no_run
     /// use enphase_api::Envoy;
     ///
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let client = Envoy::new("envoy.local");
-    /// let is_on = client.get_power_state("603980032")?;
+    /// let is_on = client.get_power_state("603980032").await?;
     /// println!("Power is {}", if is_on { "on" } else { "off" });
     /// # Ok(())
     /// # }
     /// ```
     #[inline]
     #[instrument(skip(self, serial), level = "debug")]
-    #[expect(clippy::cognitive_complexity, reason = "Instrumentation macro")]
-    pub fn get_power_state(&self, serial: impl Display) -> Result<bool> {
+    pub async fn get_power_state(&self, serial: impl Display) -> Result<bool> {
         debug!("Getting power state");
 
         let endpoint = format!("{}/ivp/mod/{}/mode/power", self.base_url, serial);
         debug!("GET {endpoint}");
 
-        let mut response = self
-            .agent
+        let response = self
+            .client
             .get(&endpoint)
             .header("Accept", "application/json, text/javascript, */*; q=0.01")
-            .call()?;
+            .send()
+            .await?;
 
-        debug!("Status code: {}", response.status());
+        let status_code = response.status();
+        debug!("Status code: {}", status_code);
 
-        let body = response.body_mut().read_to_string()?;
+        let body = response.text().await?;
         debug!("Response body: {}", body);
 
         let status: PowerStatusResponse = serde_json::from_str(&body)?;

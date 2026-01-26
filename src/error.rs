@@ -7,9 +7,9 @@
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum EnphaseError {
-    /// HTTP request error from ureq.
+    /// HTTP request error from reqwest.
     #[error("HTTP request failed: {0}")]
-    Http(#[from] ureq::Error),
+    Http(#[from] reqwest::Error),
 
     /// Invalid response from the API.
     #[error("Invalid API response: {0}")]
