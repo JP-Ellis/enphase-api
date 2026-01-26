@@ -11,18 +11,18 @@
 use crate::error::Result;
 use tracing::{debug, instrument};
 
-/// The default base URL for the Enphase Entrez service
+/// The default base URL for the Enphase Entrez service.
 const DEFAULT_ENTREZ_URL: &str = "https://entrez.enphaseenergy.com";
 
-/// Main client for the Enphase Entrez service
+/// Main client for the Enphase Entrez service.
 ///
 /// This client provides authentication and token generation for accessing
 /// Envoy devices via JWT tokens.
 #[derive(Debug)]
 pub struct Entrez {
-    /// HTTP agent for making requests
+    /// HTTP agent for making requests.
     agent: ureq::Agent,
-    /// Base URL for the Entrez service
+    /// Base URL for the Entrez service.
     base_url: String,
 }
 

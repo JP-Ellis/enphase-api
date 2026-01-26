@@ -1,4 +1,4 @@
-//! Integration tests for the Enphase API client
+//! Integration tests for the Enphase API client.
 
 #![cfg(test)]
 

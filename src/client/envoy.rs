@@ -22,15 +22,15 @@ use crate::{
 };
 use tracing::{debug, instrument};
 
-/// Main client for the Enphase Envoy local gateway
+/// Main client for the Enphase Envoy local gateway.
 ///
 /// This client provides access to local solar production, consumption, and inverter data.
 /// It handles session management and authentication with the Envoy device.
 #[derive(Debug)]
 pub struct Envoy {
-    /// HTTP agent for making requests
+    /// HTTP agent for making requests.
     agent: ureq::Agent,
-    /// Base URL for the Envoy gateway
+    /// Base URL for the Envoy gateway.
     base_url: String,
 }
 

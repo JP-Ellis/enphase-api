@@ -1,4 +1,4 @@
-//! Integration tests for the Entrez client
+//! Integration tests for the Entrez client.
 //!
 //! These tests require valid Enphase credentials and network access to the
 //! Enphase Entrez service. They are skipped if the required environment
@@ -6,7 +6,7 @@
 
 use enphase_api::Entrez;
 
-/// Check if credentials are available for testing
+/// Check if credentials are available for testing.
 fn has_credentials() -> Result<(), Box<dyn core::error::Error>> {
     std::env::var("ENTREZ_USERNAME")?;
     std::env::var("ENTREZ_PASSWORD")?;
