@@ -1,4 +1,4 @@
-//! Integration tests for the Envoy client
+//! Integration tests for the Envoy client.
 //!
 //! These tests require valid Enphase credentials and network access to both the
 //! Enphase Entrez service and an Envoy device. They are skipped if the required
@@ -6,7 +6,7 @@
 
 use enphase_api::{Entrez, Envoy, models::PowerState};
 
-/// Check if credentials are available for testing
+/// Check if credentials are available for testing.
 fn has_credentials() -> Result<(), Box<dyn core::error::Error>> {
     std::env::var("ENTREZ_USERNAME")?;
     std::env::var("ENTREZ_PASSWORD")?;
