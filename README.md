@@ -74,25 +74,33 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-enphase-api = "~1"
+enphase-api = "1"
+tokio = "1"
 ```
+
+This library uses async/await and requires an async runtime like [tokio](https://tokio.rs/).
 
 ## Quick Start
 
 ```rust
 use enphase_api::{Entrez, Envoy, PowerState};
 
-// Step 1: Authenticate with Enphase Entrez and get a JWT token
-let entrez = Entrez::default();
-entrez.login("your-email@example.com", "your-password")?;
-let token = entrez.generate_token("your-site-name", "your-envoy-serial", true)?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Step 1: Authenticate with Enphase Entrez and get a JWT token
+    let entrez = Entrez::default();
+    entrez.login("your-email@example.com", "your-password").await?;
+    let token = entrez.generate_token("your-site-name", "your-envoy-serial", true).await?;
 
-// Step 2: Connect to your local Envoy gateway
-let envoy = Envoy::new("envoy.local");
-envoy.authenticate(&token)?;
+    // Step 2: Connect to your local Envoy gateway
+    let envoy = Envoy::new("envoy.local");
+    envoy.authenticate(&token).await?;
 
-// Step 3: Control your system (example: set power state)
-envoy.set_power_state("device-serial-number", PowerState::On)?;
+    // Step 3: Control your system (example: set power state)
+    envoy.set_power_state("device-serial-number", PowerState::On).await?;
+
+    Ok(())
+}
 ```
 
 The library supports Enphase's two-step authentication:
@@ -102,6 +110,8 @@ The library supports Enphase's two-step authentication:
 
 The client then remembers the authentication state for subsequent API calls. Note that the JWT token has a limited lifespan and re-authentication may be necessary.
 
+**Note:** All API methods are async and require `.await`. You'll need an async runtime like [tokio](https://tokio.rs/) to run the examples.
+
 ### Using Environment Variables
 
 For convenience, you can use environment variables for authentication:
@@ -109,16 +119,21 @@ For convenience, you can use environment variables for authentication:
 ```rust
 use enphase_api::{Entrez, Envoy};
 
-// Set these environment variables:
-// - ENTREZ_USERNAME
-// - ENTREZ_PASSWORD
-let entrez = Entrez::default();
-entrez.login_with_env()?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Set these environment variables:
+    // - ENTREZ_USERNAME
+    // - ENTREZ_PASSWORD
+    let entrez = Entrez::default();
+    entrez.login_with_env().await?;
 
-let token = entrez.generate_token("your-site-name", "your-envoy-serial", true)?;
+    let token = entrez.generate_token("your-site-name", "your-envoy-serial", true).await?;
 
-let envoy = Envoy::new("envoy.local"); // or use IP address like "192.168.1.100"
-envoy.authenticate(&token)?;
+    let envoy = Envoy::new("envoy.local"); // or use IP address like "192.168.1.100"
+    envoy.authenticate(&token).await?;
+
+    Ok(())
+}
 ```
 
 ## Current API Coverage
