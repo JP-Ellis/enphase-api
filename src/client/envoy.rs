@@ -302,3 +302,225 @@ impl Envoy {
         Ok(!status.power_forced_off)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::PowerState;
+    use wiremock::matchers::{body_string, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Helper to load fixture files
+    fn load_fixture(category: &str, name: &str) -> serde_json::Value {
+        let fixture_path = format!("fixtures/{category}/{name}.json");
+        let content = std::fs::read_to_string(&fixture_path)
+            .unwrap_or_else(|_| panic!("Failed to read fixture: {fixture_path}"));
+        serde_json::from_str(&content)
+            .unwrap_or_else(|_| panic!("Failed to parse fixture: {fixture_path}"))
+    }
+
+    #[tokio::test]
+    async fn authenticate_success() {
+        let mock_server = MockServer::start().await;
+
+        let fixture = load_fixture("envoy", "authenticate-valid");
+        let status_code: u16 = fixture
+            .get("status_code")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| v.try_into().ok())
+            .expect("status_code is not a valid u16");
+        let body = fixture
+            .get("body")
+            .and_then(serde_json::Value::as_str)
+            .expect("body is not a string")
+            .to_owned();
+
+        Mock::given(method("GET"))
+            .and(path("/auth/check_jwt"))
+            .and(header("Authorization", "Bearer valid_token_here"))
+            .respond_with(ResponseTemplate::new(status_code).set_body_string(&body))
+            .mount(&mock_server)
+            .await;
+
+        // Create a test client that works with HTTP (wiremock uses HTTP)
+        let test_client = reqwest::Client::builder()
+            .cookie_store(true)
+            .timeout(core::time::Duration::from_secs(30))
+            .build()
+            .expect("Failed to build test client");
+
+        // Create Envoy directly with mock server's HTTP URL
+        let client = Envoy {
+            client: test_client,
+            base_url: mock_server.uri(),
+        };
+
+        let result = client.authenticate("valid_token_here").await;
+
+        assert!(
+            result.is_ok(),
+            "Authentication should succeed with valid token. Error: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticate_invalid_token() {
+        let mock_server = MockServer::start().await;
+
+        let fixture = load_fixture("envoy", "authenticate-invalid");
+        let status_code: u16 = fixture
+            .get("status_code")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| v.try_into().ok())
+            .expect("status_code is not a valid u16");
+        let body = fixture
+            .get("body")
+            .and_then(serde_json::Value::as_str)
+            .expect("body is not a string")
+            .to_owned();
+
+        Mock::given(method("GET"))
+            .and(path("/auth/check_jwt"))
+            .respond_with(ResponseTemplate::new(status_code).set_body_string(&body))
+            .mount(&mock_server)
+            .await;
+
+        let test_client = reqwest::Client::builder()
+            .cookie_store(true)
+            .timeout(core::time::Duration::from_secs(30))
+            .build()
+            .expect("Failed to build test client");
+
+        let client = Envoy {
+            client: test_client,
+            base_url: mock_server.uri(),
+        };
+
+        let result = client.authenticate("invalid_token").await;
+
+        assert!(result.is_err(), "Should fail with invalid token");
+        if let Err(err) = result {
+            assert!(
+                matches!(err, crate::error::EnphaseError::AuthenticationFailed(_)),
+                "Error should be AuthenticationFailed type"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn set_power_state() {
+        let mock_server = MockServer::start().await;
+
+        let fixture = load_fixture("envoy", "set-power-on");
+        let status_code: u16 = fixture
+            .get("status_code")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| v.try_into().ok())
+            .expect("status_code is not a valid u16");
+        let body = fixture
+            .get("body")
+            .and_then(serde_json::Value::as_str)
+            .expect("body is not a string")
+            .to_owned();
+
+        Mock::given(method("PUT"))
+            .and(path("/ivp/mod/603980032/mode/power"))
+            .and(header(
+                "Content-Type",
+                "application/x-www-form-urlencoded; charset=UTF-8",
+            ))
+            .and(body_string(r#"{"length":1,"arr":[0]}"#))
+            .respond_with(ResponseTemplate::new(status_code).set_body_string(&body))
+            .mount(&mock_server)
+            .await;
+
+        let test_client = reqwest::Client::builder()
+            .cookie_store(true)
+            .timeout(core::time::Duration::from_secs(30))
+            .build()
+            .expect("Failed to build test client");
+
+        let client = Envoy {
+            client: test_client,
+            base_url: mock_server.uri(),
+        };
+
+        let result = client.set_power_state("603980032", PowerState::On).await;
+
+        assert!(result.is_ok(), "Setting power state to ON should succeed");
+    }
+
+    #[tokio::test]
+    async fn get_power_state() {
+        let mock_server = MockServer::start().await;
+
+        let fixture = load_fixture("envoy", "get-power");
+        let status_code: u16 = fixture
+            .get("status_code")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| v.try_into().ok())
+            .expect("status_code is not a valid u16");
+        let response_body = fixture
+            .get("body")
+            .and_then(serde_json::Value::as_str)
+            .expect("body is not a string")
+            .to_owned();
+
+        Mock::given(method("GET"))
+            .and(path("/ivp/mod/603980032/mode/power"))
+            .respond_with(ResponseTemplate::new(status_code).set_body_string(&response_body))
+            .mount(&mock_server)
+            .await;
+
+        let test_client = reqwest::Client::builder()
+            .cookie_store(true)
+            .timeout(core::time::Duration::from_secs(30))
+            .build()
+            .expect("Failed to build test client");
+
+        let client = Envoy {
+            client: test_client,
+            base_url: mock_server.uri(),
+        };
+
+        let is_on = client
+            .get_power_state("603980032")
+            .await
+            .expect("Should succeed");
+
+        assert!(is_on, "Power should be ON when powerForcedOff is false");
+    }
+
+    #[tokio::test]
+    async fn get_power_state_invalid_json() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/ivp/mod/603980032/mode/power"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("Invalid JSON response"))
+            .mount(&mock_server)
+            .await;
+
+        let test_client = reqwest::Client::builder()
+            .cookie_store(true)
+            .timeout(core::time::Duration::from_secs(30))
+            .build()
+            .expect("Failed to build test client");
+
+        let client = Envoy {
+            client: test_client,
+            base_url: mock_server.uri(),
+        };
+
+        let result = client.get_power_state("603980032").await;
+
+        assert!(result.is_err(), "Should fail with invalid JSON");
+        if let Err(err) = result {
+            assert!(
+                matches!(err, crate::error::EnphaseError::JsonError(_)),
+                "Error should be JsonError type"
+            );
+        }
+    }
+}

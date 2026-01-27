@@ -1,0 +1,17 @@
+{
+  "name": "get-power",
+  "status_code": 200,
+  "headers": [
+    "HTTP/1.1 200 OK\r",
+    "Server: openresty/VERSION_REMOVED\r",
+    "Date: Mon, 01 Jan 2024 00:00:00 GMT\r",
+    "Content-Type: application/json\r",
+    "Content-Length: 27\r",
+    "Connection: keep-alive\r",
+    "Strict-Transport-Security: max-age=63072000; includeSubdomains\r",
+    "X-Frame-Options: DENY\r",
+    "X-Content-Type-Options: nosniff\r",
+    "\r"
+  ],
+  "body": "{ \"powerForcedOff\" : false}\n"
+}

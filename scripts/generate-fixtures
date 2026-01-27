@@ -1,0 +1,585 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+
+# Fixture Generation Script for enphase-api
+#
+# This script captures real HTTP request/response pairs from Enphase APIs
+# and saves them as test fixtures with sanitized sensitive data.
+#
+# Environment variables (should be in .env, loaded by direnv):
+#   ENTREZ_USERNAME
+#   ENTREZ_PASSWORD
+#   ENVOY_HOST
+#   ENVOY_NAME
+#   ENVOY_SERIAL_NUMBER
+#
+set -euo pipefail
+
+################################################################################
+## Configuration
+################################################################################
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+FIXTURES_DIR="$PROJECT_ROOT/fixtures"
+ENTREZ_BASE_URL="${ENTREZ_BASE_URL:-https://entrez.enphaseenergy.com}"
+TMP_DIR=$(mktemp -d)
+COOKIE_JAR="$TMP_DIR/cookies.txt"
+
+# Source utility functions
+# shellcheck source=scripts/util.sh
+source "$SCRIPT_DIR/util.sh"
+
+debug "Temporary directory: $TMP_DIR"
+
+################################################################################
+## Flags
+################################################################################
+
+DRY_RUN=false
+
+################################################################################
+## Cleanup
+################################################################################
+
+# Cleanup temporary files on exit
+#
+# This function is called automatically when the script exits.
+#
+cleanup() {
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
+
+################################################################################
+## Sanitization Functions
+################################################################################
+
+# Sanitize JWT tokens in content
+#
+# Replaces JWT tokens (eyJ...) with a placeholder to prevent leaking
+# sensitive authentication data.
+#
+# Usage:
+#   sanitize_token <content>
+#
+# Arguments:
+#   $1 - The content to sanitize
+#
+# Example:
+#   sanitized=$(sanitize_token "$response_body")
+#
+sanitize_token() {
+  local content="$1"
+  # Replace JWT tokens (eyJ...) with placeholder
+  echo "$content" |
+    sed -E 's/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/SANITIZED_JWT_TOKEN/g'
+}
+
+# Sanitize cookies in content
+#
+# Replaces session cookies with placeholders to prevent leaking
+# sensitive session data.
+#
+# Usage:
+#   sanitize_cookies <content>
+#
+# Arguments:
+#   $1 - The content to sanitize
+#
+# Example:
+#   sanitized=$(sanitize_cookies "$headers")
+#
+sanitize_cookies() {
+  local content="$1"
+  # Replace session cookies with placeholder
+  echo "$content" |
+    sed -E 's/sessionId=[^;]+/sessionId=SANITIZED_SESSION/g' |
+    sed -E 's/SESSION=[^;]+/SESSION=SANITIZED_SESSION/g' |
+    sed -E 's/Set-Cookie: [^;]+/Set-Cookie: SANITIZED_COOKIE/g'
+}
+
+# Sanitize CSRF tokens in content
+#
+# Replaces CSRF tokens in form inputs with placeholders to prevent leaking
+# sensitive session data.
+#
+# Usage:
+#   sanitize_csrf <content>
+#
+# Arguments:
+#   $1 - The content to sanitize
+#
+# Example:
+#   sanitized=$(sanitize_csrf "$response_body")
+#
+sanitize_csrf() {
+  local content="$1"
+  # Replace CSRF tokens in form inputs with placeholder
+  echo "$content" |
+    sed -E 's/name="_csrf" value="[^"]+"/name="_csrf" value="SANITIZED_CSRF_TOKEN"/g'
+}
+
+# Sanitize third-party script IDs in content
+#
+# Replaces third-party tracking/analytics script identifiers with placeholders
+# to prevent leaking service-specific identifiers.
+#
+# Usage:
+#   sanitize_script_ids <content>
+#
+# Arguments:
+#   $1 - The content to sanitize
+#
+# Example:
+#   sanitized=$(sanitize_script_ids "$response_body")
+#
+sanitize_script_ids() {
+  local content="$1"
+  # Replace script IDs (hexadecimal identifiers) in script sources
+  echo "$content" |
+    sed -E 's|https://app\.secureprivacy\.ai/script/[a-f0-9]+\.js|https://app.secureprivacy.ai/script/SANITIZED_SCRIPT_ID.js|g'
+}
+
+# Sanitize server version information in headers
+#
+# Replaces specific server version numbers with generic placeholders
+# to prevent information disclosure that could aid attackers.
+#
+# Usage:
+#   sanitize_server_version <headers>
+#
+# Arguments:
+#   $1 - The headers content to sanitize
+#
+# Example:
+#   sanitized=$(sanitize_server_version "$headers")
+#
+sanitize_server_version() {
+  local content="$1"
+  # Replace server version numbers with placeholder
+  echo "$content" |
+    sed -E 's/Server: ([^/]+)\/[0-9.]+/Server: \1\/VERSION_REMOVED/g'
+}
+
+# Sanitize timestamps in headers
+#
+# Replaces exact timestamps with a generic placeholder date to prevent
+# correlation of fixture generation time with other activities.
+#
+# Usage:
+#   sanitize_timestamps <headers>
+#
+# Arguments:
+#   $1 - The headers content to sanitize
+#
+# Example:
+#   sanitized=$(sanitize_timestamps "$headers")
+#
+sanitize_timestamps() {
+  local content="$1"
+  # Replace Date headers with a normalized mock date
+  echo "$content" |
+    sed -E 's/[dD]ate: [A-Z][a-z]{2}, [0-9]{1,2} [A-Z][a-z]{2} [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT/Date: Mon, 01 Jan 2024 00:00:00 GMT/g'
+}
+
+################################################################################
+## HTTP Utilities
+################################################################################
+
+# Save fixture as JSON
+#
+# Saves HTTP response data as a JSON fixture file with sanitized
+# sensitive data. Automatically extracts status code, headers, and body
+# from the curl output files.
+#
+# Usage:
+#   save_fixture <category> <name> <output_prefix>
+#
+# Arguments:
+#   $1 - Category ("entrez" or "envoy")
+#   $2 - Fixture name (e.g., "login-success")
+#   $3 - Output prefix from capture_curl
+#
+# Example:
+#   output=$(capture_curl -X POST ...)
+#   save_fixture entrez "login-success" "$output"
+#
+save_fixture() {
+  local category="$1"
+  local name="$2"
+  local output_prefix="$3"
+
+  local fixture_dir="$FIXTURES_DIR/$category"
+  local fixture_file="$fixture_dir/${name}.json"
+
+  # Extract data from curl output files
+  local headers_file="${output_prefix}_headers.txt"
+  local stdout_file="${output_prefix}_stdout.txt"
+
+  # Extract status code
+  local status_line
+  status_line=$(head -n 1 "$headers_file")
+  local status_code
+  status_code=$(echo "$status_line" | grep -o '[0-9]\{3\}' | head -n 1)
+
+  if [[ -z $status_code ]]; then
+    err "Failed to parse HTTP status code from response"
+  fi
+
+  # Read headers and body
+  local headers
+  headers=$(cat "$headers_file")
+  local body
+  body=$(cat "$stdout_file")
+
+  # Sanitize sensitive data
+  local sanitized_body
+  sanitized_body=$(sanitize_token "$body")
+  sanitized_body=$(sanitize_cookies "$sanitized_body")
+  sanitized_body=$(sanitize_csrf "$sanitized_body")
+  sanitized_body=$(sanitize_script_ids "$sanitized_body")
+
+  local sanitized_headers
+  sanitized_headers=$(sanitize_cookies "$headers")
+  sanitized_headers=$(sanitize_csrf "$sanitized_headers")
+  sanitized_headers=$(sanitize_server_version "$sanitized_headers")
+  sanitized_headers=$(sanitize_timestamps "$sanitized_headers")
+
+  # Create JSON structure
+  local json_content
+  json_content=$(
+    cat <<EOF
+{
+  "name": "$name",
+  "status_code": $status_code,
+  "headers": $(echo "$sanitized_headers" | jq -Rs 'split("\n") | map(select(length > 0))'),
+  "body": $(echo "$sanitized_body" | jq -Rs '.')
+}
+EOF
+  )
+
+  if [[ $DRY_RUN == true ]]; then
+    info "Would save fixture: $fixture_file"
+    echo "$json_content" | jq '.'
+  else
+    echo "$json_content" >"$fixture_file"
+    info "Saved fixture: $fixture_file"
+  fi
+}
+
+# Capture HTTP request/response using curl
+#
+# Executes curl with standard curl arguments plus a custom --with-cookies flag.
+# Automatically adds flags for secure execution and output capture.
+#
+# The function captures stdout, headers, and stderr into temporary files, which
+# can be modified in place before saving as fixtures with save_fixture().
+#
+# Usage:
+#   capture_curl [--with-cookies] <curl-args>...
+#
+# Custom Arguments:
+#   --with-cookies   Enable cookie jar for session management
+#
+# Standard curl arguments are passed through directly.
+# The following flags are automatically added:
+#   -k             Allow insecure SSL connections
+#   -s             Silent mode
+#   -S             Show errors even in silent mode
+#   -o <file>      Write response body to file
+#   -D <file>      Write response headers to file
+#   --stderr <file> Write stderr to file
+#
+# Returns:
+#   Prints path prefix for output files (_stdout.txt, _headers.txt, _stderr.txt)
+#
+# Examples:
+#   output=$(capture_curl -X POST --data-raw "foo=bar" -H "Content-Type: application/x-www-form-urlencoded" https://example.com/login --with-cookies)
+#   output=$(capture_curl -X GET https://example.com/api/data)
+#
+capture_curl() {
+  local use_cookies=false
+  local curl_args=()
+
+  # Parse arguments
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --with-cookies)
+      use_cookies=true
+      shift
+      ;;
+    *)
+      # Pass through to curl
+      curl_args+=("$1")
+      shift
+      ;;
+    esac
+  done
+
+  local curl_stderr="$TMP_DIR/curl_stderr.txt"
+  local curl_stdout="$TMP_DIR/curl_stdout.txt"
+  local curl_headers="$TMP_DIR/curl_headers.txt"
+
+  # Build the final curl command with automatic flags
+  local curl_cmd=(curl -k -s -S)
+
+  # Add output files
+  curl_cmd+=(-o "$curl_stdout" -D "$curl_headers" --stderr "$curl_stderr")
+
+  # Add cookie handling if requested
+  if [[ $use_cookies == true ]]; then
+    curl_cmd+=(-b "$COOKIE_JAR" -c "$COOKIE_JAR")
+  fi
+
+  # Add user's arguments
+  curl_cmd+=("${curl_args[@]}")
+
+  # Execute curl
+  "${curl_cmd[@]}"
+
+  # Return path prefix (caller expects _stdout.txt, _headers.txt, _stderr.txt)
+  echo "$TMP_DIR/curl"
+}
+
+################################################################################
+## Entrez Fixtures
+################################################################################
+
+# Capture successful Entrez login
+#
+# Captures the HTTP response for a successful login to the Entrez service.
+#
+capture_entrez_login_success() {
+  info "Capturing Entrez login (success)..."
+
+  local output
+  output=$(capture_curl \
+    -X POST \
+    --data-raw "username=$ENTREZ_USERNAME&password=$ENTREZ_PASSWORD&authFlow=entrezSession" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    "$ENTREZ_BASE_URL/login" \
+    --with-cookies)
+
+  save_fixture entrez "login-success" "$output"
+}
+
+# Capture failed Entrez login
+#
+# Captures the HTTP response for a failed login attempt to the Entrez service.
+#
+capture_entrez_login_failure() {
+  info "Capturing Entrez login (failure)..."
+
+  local output
+  output=$(capture_curl \
+    -X POST \
+    --data-raw "username=invalid@example.com&password=wrongpassword&authFlow=entrezSession" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    "$ENTREZ_BASE_URL/login")
+
+  save_fixture entrez "login-failure" "$output"
+}
+
+# Capture successful Entrez token generation
+#
+# Captures the HTTP response for successful JWT token generation.
+#
+capture_entrez_generate_token() {
+  info "Capturing Entrez token generation (success)..."
+
+  # Normalize site name: lowercase and replace spaces with +
+  local normalized_site
+  normalized_site=$(echo "$ENVOY_NAME" | tr '[:upper:]' '[:lower:]' | tr ' ' '+')
+
+  local output
+  output=$(capture_curl \
+    -X POST \
+    --data-raw "uncommissioned=on&Site=$normalized_site&serialNum=$ENVOY_SERIAL_NUMBER" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    "$ENTREZ_BASE_URL/entrez_tokens" \
+    --with-cookies)
+
+  # Extract token for use in Envoy tests (before sanitization)
+  local token
+  token=$(<"${output}_stdout.txt" sed -n 's/.*id="JWTToken"[^>]*>[[:space:]]*\([^<]*\)<.*/\1/p' | xargs)
+  if [[ -z $token ]]; then
+    err "Failed to extract JWT token from response"
+  fi
+  echo "$token" >"$TMP_DIR/jwt_token.txt"
+  info "Extracted JWT token for Envoy authentication"
+
+  save_fixture entrez "generate-token-success" "$output"
+}
+
+################################################################################
+## Envoy Fixtures
+################################################################################
+
+# Capture successful Envoy authentication
+#
+# Captures the HTTP response for successful JWT authentication with Envoy.
+#
+capture_envoy_authenticate_valid() {
+  info "Capturing Envoy authentication (valid token)..."
+
+  # Get token from previous step
+  local token
+  token=$(cat "$TMP_DIR/jwt_token.txt")
+
+  local output
+  output=$(capture_curl \
+    -X GET \
+    -H "Authorization: Bearer $token" \
+    "https://$ENVOY_HOST/auth/check_jwt" \
+    --with-cookies)
+
+  save_fixture envoy "authenticate-valid" "$output"
+}
+
+# Capture failed Envoy authentication
+#
+# Captures the HTTP response for an invalid JWT token.
+#
+capture_envoy_authenticate_invalid() {
+  info "Capturing Envoy authentication (invalid token)..."
+
+  local output
+  output=$(capture_curl \
+    -X GET \
+    -H "Authorization: Bearer invalid_token_here" \
+    "https://$ENVOY_HOST/auth/check_jwt")
+
+  save_fixture envoy "authenticate-invalid" "$output"
+}
+
+# Capture Envoy set power state (ON)
+#
+# Captures the HTTP response for setting power state to ON.
+#
+capture_envoy_set_power_on() {
+  info "Capturing Envoy set power state (ON)..."
+
+  local output
+  output=$(capture_curl \
+    -X PUT \
+    --data-raw '{"length":1,"arr":[0]}' \
+    -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" \
+    "https://$ENVOY_HOST/ivp/mod/$ENVOY_LOCAL_ID/mode/power" \
+    --with-cookies)
+
+  save_fixture envoy "set-power-on" "$output"
+}
+
+# Capture Envoy get power state
+#
+# Captures the HTTP response for getting power state.
+#
+capture_envoy_get_power_state() {
+  info "Capturing Envoy get power state..."
+
+  local output
+  output=$(capture_curl \
+    -X GET \
+    -H "Accept: application/json, text/javascript, */*; q=0.01" \
+    "https://$ENVOY_HOST/ivp/mod/$ENVOY_LOCAL_ID/mode/power" \
+    --with-cookies)
+
+  save_fixture envoy "get-power" "$output"
+}
+
+################################################################################
+## Main
+################################################################################
+
+# Parse command-line arguments
+#
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --dry-run)
+      DRY_RUN=true
+      warn "Running in dry-run mode - no files will be saved"
+      shift
+      ;;
+    -h | --help)
+      cat <<EOF
+Usage: $0 [OPTIONS]
+
+Capture HTTP request/response pairs from Enphase APIs for test fixtures.
+
+Options:
+  --dry-run    Preview fixtures without saving to disk
+  -h, --help   Show this help message
+
+Environment variables (required):
+  ENTREZ_USERNAME       Your Enphase account username
+  ENTREZ_PASSWORD       Your Enphase account password
+  ENVOY_HOST            Your Envoy device hostname/IP
+  ENVOY_NAME            Your Envoy site name
+  ENVOY_SERIAL_NUMBER   Your Envoy device serial number
+  ENVOY_LOCAL_ID        Your Envoy device local ID (i.e., after /ivp/mod/)
+
+Example:
+  $0
+  $0 --dry-run
+EOF
+      exit 0
+      ;;
+    *)
+      err "Unknown option: $1"
+      ;;
+    esac
+  done
+}
+
+# Main execution
+#
+main() {
+  parse_args "$@"
+
+  # Check required commands
+  assert_cmd curl
+  assert_cmd jq
+  assert_cmd grep
+  assert_cmd sed
+
+  # Check required environment variables
+  assert_env ENTREZ_USERNAME
+  assert_env ENTREZ_PASSWORD
+  assert_env ENVOY_HOST
+  assert_env ENVOY_NAME
+  assert_env ENVOY_SERIAL_NUMBER
+  assert_env ENVOY_LOCAL_ID
+
+  info "Starting fixture generation..."
+  info "Fixtures will be saved to: $FIXTURES_DIR"
+
+  # Create fixture directories
+  if [[ $DRY_RUN == false ]]; then
+    ensure mkdir -p "$FIXTURES_DIR/entrez"
+    ensure mkdir -p "$FIXTURES_DIR/envoy"
+  fi
+
+  # Capture Entrez fixtures
+  info "=== Capturing Entrez Fixtures ==="
+  capture_entrez_login_success
+  capture_entrez_login_failure
+  capture_entrez_generate_token
+
+  # Capture Envoy fixtures
+  info "=== Capturing Envoy Fixtures ==="
+  capture_envoy_authenticate_valid
+  capture_envoy_authenticate_invalid
+  capture_envoy_set_power_on
+  capture_envoy_get_power_state
+
+  info "Fixture generation complete!"
+
+  if [[ $DRY_RUN == false ]]; then
+    warn "Remember to review fixtures for any remaining sensitive data before committing!"
+  fi
+}
+
+# Run main
+main "$@"
