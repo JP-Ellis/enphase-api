@@ -211,9 +211,8 @@ jobs:
         with:
           tool: cargo-tarpaulin
 
-      # Disabled for now until we can add tests that run in CI
-      # - name: Run cargo tarpaulin
-      #   run: cargo tarpaulin --out Xml
+      - name: Run cargo tarpaulin
+        run: cargo tarpaulin --out Xml
 
       - name: Upload Rust coverage artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
@@ -262,9 +261,8 @@ jobs:
         with:
           tool: cargo-hack,nextest
 
-      # Disabled for now until we can add tests that run in CI
-      # - name: Run tests
-      #   run: |-
-      #     cargo hack --feature-powerset \
-      #       nextest run \
-      #       --workspace
+      - name: Run tests
+        shell: bash
+        run: |-
+          cargo hack --feature-powerset \
+            nextest run --workspace

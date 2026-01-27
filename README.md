@@ -180,18 +180,46 @@ If you'd like to add support for additional API endpoints, please feel free to o
 
 ## Testing
 
-Run the test suite:
+This library includes both unit tests and integration tests:
+
+### Unit Tests
+
+Unit tests run without credentials or hardware access using mock servers ([wiremock](https://github.com/LukeMathWalker/wiremock-rs)):
 
 ```bash
-# Run unit tests
-cargo test
-
-# Run tests with nextest (faster)
 cargo nextest run
+```
 
-# Run integration tests (requires credentials)
+Unit tests cover:
+
+-   Entrez client: login, token generation, environment-based auth
+-   Envoy client: JWT authentication, power state control
+-   Models: PowerState and PowerStatusResponse serialization
+
+These tests rely on fixtures stored in the `fixtures/` directory, which contain sanitized HTTP request/response pairs. These fixtures can be recreated or updated using the script:
+
+```bash
+./scripts/generate-fixtures
+# Or for a dry run without saving:
+./scripts/generate-fixtures --dry-run
+```
+
+### Integration Tests
+
+Integration tests require actual Enphase credentials and hardware access:
+
+```bash
+# Run integration tests (requires environment variables)
 cargo test --test integration -- --ignored
 ```
+
+Required environment variables for integration tests:
+
+-   `ENTREZ_USERNAME` - Your Enphase account username
+-   `ENTREZ_PASSWORD` - Your Enphase account password
+-   `ENVOY_HOST` - Your Envoy device hostname/IP
+-   `ENVOY_NAME` - Your Envoy site name
+-   `ENVOY_SERIAL_NUMBER` - Your Envoy device serial number
 
 ## License
 

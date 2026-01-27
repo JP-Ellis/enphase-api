@@ -1,0 +1,15 @@
+{
+  "name": "set-power-on",
+  "status_code": 204,
+  "headers": [
+    "HTTP/1.1 204 No Content\r",
+    "Server: openresty/VERSION_REMOVED\r",
+    "Date: Mon, 01 Jan 2024 00:00:00 GMT\r",
+    "Connection: keep-alive\r",
+    "Strict-Transport-Security: max-age=63072000; includeSubdomains\r",
+    "X-Frame-Options: DENY\r",
+    "X-Content-Type-Options: nosniff\r",
+    "\r"
+  ],
+  "body": "\n"
+}

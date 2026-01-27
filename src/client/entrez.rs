@@ -297,3 +297,250 @@ impl Entrez {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Helper to load fixture files
+    fn load_fixture(category: &str, name: &str) -> serde_json::Value {
+        let fixture_path = format!("fixtures/{category}/{name}.json");
+        let content = std::fs::read_to_string(&fixture_path)
+            .unwrap_or_else(|_| panic!("Failed to read fixture: {fixture_path}"));
+        serde_json::from_str(&content)
+            .unwrap_or_else(|_| panic!("Failed to parse fixture: {fixture_path}"))
+    }
+
+    #[tokio::test]
+    async fn login_success() {
+        let mock_server = MockServer::start().await;
+
+        let fixture = load_fixture("entrez", "login-success");
+        let status_code: u16 = fixture
+            .get("status_code")
+            .expect("status_code not found in fixture")
+            .as_u64()
+            .and_then(|v| v.try_into().ok())
+            .expect("status_code is not a valid u16");
+        // Find the set-cookie header in the headers array
+        let cookie_value = fixture
+            .get("headers")
+            .and_then(|h| h.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .find(|h| h.to_lowercase().starts_with("set-cookie:"))
+                    .map(|h| {
+                        h.trim_end_matches('\r')
+                            .trim_start_matches("set-cookie:")
+                            .trim()
+                    })
+            })
+            .expect("set-cookie header not found in fixture")
+            .to_owned();
+
+        Mock::given(method("POST"))
+            .and(path("/login"))
+            .and(body_string_contains("username=test%40example.com"))
+            .and(body_string_contains("password=test_password"))
+            .and(body_string_contains("authFlow=entrezSession"))
+            .respond_with(
+                ResponseTemplate::new(status_code).append_header("Set-Cookie", &cookie_value),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = Entrez::new(mock_server.uri());
+        let result = client.login("test@example.com", "test_password").await;
+
+        assert!(
+            result.is_ok(),
+            "Login should succeed with valid credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn login_invalid_credentials() {
+        let mock_server = MockServer::start().await;
+
+        let fixture = load_fixture("entrez", "login-failure");
+        let status_code: u16 = fixture
+            .get("status_code")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| v.try_into().ok())
+            .expect("status_code is not a valid u16");
+        let body = fixture
+            .get("body")
+            .and_then(serde_json::Value::as_str)
+            .expect("body is not a string")
+            .to_owned();
+
+        Mock::given(method("POST"))
+            .and(path("/login"))
+            .respond_with(ResponseTemplate::new(status_code).set_body_string(&body))
+            .mount(&mock_server)
+            .await;
+
+        let client = Entrez::new(mock_server.uri());
+        let result = client.login("wrong@example.com", "wrong_password").await;
+
+        // Note: Current implementation doesn't check status code in login()
+        // This test documents current behavior
+        assert!(
+            result.is_ok(),
+            "Current implementation accepts any response"
+        );
+    }
+
+    #[tokio::test]
+    async fn login_network_error() {
+        // Use an invalid URL to simulate network error
+        let client = Entrez::new("http://localhost:1");
+        let result = client.login("test@example.com", "test_password").await;
+
+        assert!(result.is_err(), "Login should fail with network error");
+        if let Err(err) = result {
+            assert!(
+                matches!(err, crate::error::EnphaseError::Http(_)),
+                "Error should be HTTP error type"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_token_success() {
+        let mock_server = MockServer::start().await;
+
+        let fixture = load_fixture("entrez", "generate-token-success");
+        let status_code: u16 = fixture
+            .get("status_code")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| v.try_into().ok())
+            .expect("status_code is not a valid u16");
+        let html_response = fixture
+            .get("body")
+            .and_then(serde_json::Value::as_str)
+            .expect("body is not a string")
+            .to_owned();
+
+        Mock::given(method("POST"))
+            .and(path("/entrez_tokens"))
+            .respond_with(
+                ResponseTemplate::new(status_code)
+                    .set_body_string(&html_response)
+                    .insert_header("Content-Type", "text/html; charset=utf-8"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = Entrez::new(mock_server.uri());
+        let token = client
+            .generate_token("My Site", "121212121212", true)
+            .await
+            .expect("Token generation should succeed");
+
+        // Token should not be empty
+        assert!(!token.is_empty(), "Token should not be empty");
+    }
+
+    #[tokio::test]
+    async fn generate_token_commissioned() {
+        let mock_server = MockServer::start().await;
+        let expected_token = "test_token_for_commissioned";
+
+        let html_response = format!(
+            r#"<html><body><textarea id="JWTToken">{expected_token}</textarea></body></html>"#
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/entrez_tokens"))
+            .and(body_string_contains("uncommissioned=on"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(html_response))
+            .mount(&mock_server)
+            .await;
+
+        let client = Entrez::new(mock_server.uri());
+        let token = client
+            .generate_token("Test Site", "603980032", true)
+            .await
+            .expect("Should succeed");
+
+        assert_eq!(token, expected_token);
+    }
+
+    #[tokio::test]
+    async fn generate_token_missing_textarea() {
+        let mock_server = MockServer::start().await;
+
+        // Use hardcoded response for this test - we want to test when textarea is completely missing
+        let html_response = "<!DOCTYPE html>
+<html>
+<head><title>Error</title></head>
+<body>
+    <p>Error: Invalid request or unauthorized</p>
+</body>
+</html>";
+
+        Mock::given(method("POST"))
+            .and(path("/entrez_tokens"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(html_response))
+            .mount(&mock_server)
+            .await;
+
+        let client = Entrez::new(mock_server.uri());
+        let result = client.generate_token("My Site", "121212121212", true).await;
+
+        assert!(result.is_err(), "Should fail when token not in response");
+        if let Err(err) = result {
+            assert!(
+                matches!(err, crate::error::EnphaseError::InvalidResponse(_)),
+                "Error should be InvalidResponse type"
+            );
+        }
+    }
+
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "Setting and removing environment variables in tests"
+    )]
+    #[tokio::test]
+    async fn login_with_env_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/login"))
+            .respond_with(
+                ResponseTemplate::new(200).append_header("Set-Cookie", "sessionId=xyz789; Path=/"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // Set environment variables for test
+        // SAFETY: This is a test function and we need to set environment variables
+        // for testing purposes. The variables are cleaned up after the test.
+        unsafe {
+            std::env::set_var("ENTREZ_USERNAME", "env_test@example.com");
+            std::env::set_var("ENTREZ_PASSWORD", "env_test_password");
+        }
+
+        let client = Entrez::new(mock_server.uri());
+        let result = client.login_with_env().await;
+
+        // Clean up environment variables
+        // SAFETY: Removing test environment variables that were set earlier in this test.
+        // No other code should be accessing these variables concurrently.
+        unsafe {
+            std::env::remove_var("ENTREZ_USERNAME");
+            std::env::remove_var("ENTREZ_PASSWORD");
+        }
+
+        assert!(
+            result.is_ok(),
+            "Login with env vars should succeed when vars are set"
+        );
+    }
+}

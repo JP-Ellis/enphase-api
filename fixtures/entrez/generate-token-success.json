@@ -1,0 +1,20 @@
+{
+  "name": "generate-token-success",
+  "status_code": 200,
+  "headers": [
+    "HTTP/2 200 \r",
+    "Date: Mon, 01 Jan 2024 00:00:00 GMT\r",
+    "content-type: text/html;charset=UTF-8\r",
+    "content-length: 3795\r",
+    "cache-control: no-cache, no-store, max-age=0, must-revalidate\r",
+    "content-language: en-US\r",
+    "expires: 0\r",
+    "pragma: no-cache\r",
+    "strict-transport-security: max-age=31536000; includeSubDomains\r",
+    "x-content-type-options: nosniff\r",
+    "x-frame-options: DENY\r",
+    "x-xss-protection: 0\r",
+    "\r"
+  ],
+  "body": "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <script src=\"https://app.secureprivacy.ai/script/SANITIZED_SCRIPT_ID.js\"></script>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    <title>Enphase Authentication | Token</title>\n    <link rel=\"stylesheet\" href=\"https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,100;0,300;0,400;0,500;0,700;0,900;1,100;1,300;1,400;1,500;1,700;1,900&display=swap\" />\n    <link rel=\"stylesheet\" href=\"/style.css\" />\n</head>\n<body>\n<div id=\"root2\">\n    <!-- Page Header -->\n    <header class=\"container-fluid header\">\n        <a href=\"#\" class=\"header__logo\">\n            <img src=\"/ENLMLogo.png\" title=\"Enlighten Manager\" alt=\"Enlighten Manager\" />\n        </a>\n    </header>\n\n    <!-- Page Content -->\n    <article class=\"container-fluid content\">\n        <!-- Generated Access token -->\n        <section class=\"container\">\n            <a href=\"/entrez_tokens\" class=\"content__back\"><img src=\"/back.svg\" alt=\"Back\" />Back</a>\n            <h1 class=\"content__title\">Authentication</h1>\n            <div class=\"content__card\">\n                <h2>Access token</h2>\n                <form class=\"content__form\">\n                    <fieldset>\n                        <div class=\"content__form-group\">\n                            <textarea name=\"accessToken\" id=\"JWTToken\" cols=\"30\" rows=\"10\" >SANITIZED_JWT_TOKEN</textarea>\n                        </div>\n                        <button type=\"button\" onclick=\"copyAndClose()\">Copy and close</button>\n                    </fieldset>\n                </form>\n                <p>\n                    <strong>Warning:</strong><br />\n                    The access token will only be displayed once. It will not be shared and cannot be retrieved. Please be sure to save it now.\n                </p>\n            </div>\n        </section>\n    </article>\n</div>\n<script>\nfunction copyAndClose() {\n    /* Get the text field */\n    var copyText = document.getElementById(\"JWTToken\");\n\n    /* Select the text field */\n    copyText.select();\n    copyText.setSelectionRange(0, 99999); /*For mobile devices*/\n\n    /* Copy the text inside the text field */\n    document.execCommand(\"copy\");\n\n    window.location.href=\"/entrez_tokens\"\n}\n</script>\n<footer class=\"footer\" style=\"display: flex; align-items: center; gap: 10px; padding: 10px 20px;\">\n    <!-- SecurePrivacy logo appears automatically, so add spacing -->\n    <span style=\"margin-left: 40px;\"></span>\n\n    <div class=\"footer__content\" style=\"display: flex; flex-wrap: wrap; align-items: center; gap: 10px; font-size: 14px;\">\n        <span style=\"color: #ee610c;\" >©2008–2025 Enphase Energy Inc. All rights reserved.</span>\n        <a href=\"https://enphase.com/en-us/legal/privacy-policy\" style=\"color: #ee610c;\" target=\"_blank\"  rel=\"noopener noreferrer\">Privacy</a>\n        <span style=\"color: #ee610c;\">|</span>\n        <a href=\"https://enphase.com/en-us/legal/terms-of-service\" style=\"color: #ee610c;\"  target=\"_blank\"  rel=\"noopener noreferrer\">Terms</a>\n        <span style=\"color: #ee610c;\">|</span>\n        <a href=\"#\" role=\"button\" style=\"color: #ee610c;\"\n           onclick=\"event.preventDefault(); if (window.parent?.sp?.openTrustWidget) { window.parent.sp.openTrustWidget(); }\">\n            Settings / Do not sell or share my personal information\n        </a>\n    </div>\n</footer>\n</body>\n</html>\n"
+}

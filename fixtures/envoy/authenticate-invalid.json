@@ -1,0 +1,14 @@
+{
+  "name": "authenticate-invalid",
+  "status_code": 401,
+  "headers": [
+    "HTTP/1.1 401 Unauthorized\r",
+    "Server: openresty/VERSION_REMOVED\r",
+    "Date: Mon, 01 Jan 2024 00:00:00 GMT\r",
+    "Content-Type: text/html\r",
+    "Content-Length: 555\r",
+    "Connection: keep-alive\r",
+    "\r"
+  ],
+  "body": "<html>\r\n<head><title>401 Authorization Required</title></head>\r\n<body>\r\n<center><h1>401 Authorization Required</h1></center>\r\n<hr><center>Redirecting to <a id='link' href=''></a></center>\r\n<script>\r\nconst redirect_url = window.location.protocol + '//' + window.location.host + '/home';\r\nfunction redirect() { window.location.href = redirect_url; }\r\nwindow.onload = function() {\r\n    const link = document.getElementById('link');\r\n    link.href = redirect_url;\r\n    link.text = redirect_url;\r\n    setTimeout(redirect, 500);\r\n}\r\n</script>\r\n</body>\r\n</html>\n"
+}
