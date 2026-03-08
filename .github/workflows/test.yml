@@ -143,7 +143,7 @@ jobs:
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2.8.2
 
       - name: Install Rust tools
-        uses: taiki-e/install-action@509565405a8a987e73cf742e26b26dcc72c4b01a  # v2.67.26
+        uses: taiki-e/install-action@b18b9d93a43496aeda12369e7563d9251abc2fe1  # v2.68.24
         with:
           tool: cargo-hack,cargo-action-fmt
 
@@ -214,7 +214,7 @@ jobs:
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2.8.2
 
       - name: Install Rust tools
-        uses: taiki-e/install-action@509565405a8a987e73cf742e26b26dcc72c4b01a  # v2.67.26
+        uses: taiki-e/install-action@b18b9d93a43496aeda12369e7563d9251abc2fe1  # v2.68.24
         with:
           tool: cargo-tarpaulin
 
@@ -264,7 +264,7 @@ jobs:
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5  # v2.8.2
 
       - name: Install Rust tools
-        uses: taiki-e/install-action@509565405a8a987e73cf742e26b26dcc72c4b01a  # v2.67.26
+        uses: taiki-e/install-action@b18b9d93a43496aeda12369e7563d9251abc2fe1  # v2.68.24
         with:
           tool: cargo-hack,nextest
 
