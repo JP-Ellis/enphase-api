@@ -38,7 +38,7 @@ anyhow            = "=1.0.102"
 insta             = "=1.47.2"
 pretty_assertions = "=1.4.1"
 rstest            = "=0.26.1"
-tokio             = { version = "=1.51.1", features = ["macros", "rt-multi-thread"] }
+tokio             = { version = "=1.52.0", features = ["macros", "rt-multi-thread"] }
 wiremock          = "=0.6.5"
 
 ################################################################################
