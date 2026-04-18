@@ -1,34 +1,29 @@
 #:schema https://www.schemastore.org/cargo.json
+
 [package]
-name = "enphase-api"
-
-description = "Rust client for Enphase/Envoy API"
-license     = "MIT"
-readme      = "README.md"
+name        = "enphase-api"
 version     = "1.0.0"
+description = "Rust client for Enphase/Envoy API"
+readme      = "README.md"
+repository  = "https://github.com/JP-Ellis/enphase-api"
+license     = "MIT"
+keywords    = ["api", "enphase", "envoy", "solar"]
+categories  = ["api-bindings"]
 
-categories = ["api-bindings"]
-keywords   = ["api", "enphase", "envoy", "solar"]
-
-repository = "https://github.com/JP-Ellis/enphase-api"
-
-################################################################################
-## Dependencies
-################################################################################
 edition = "2024"
 
 [dependencies]
-reqwest = { version = "0.13", default-features = false, features = [
+reqwest    = { version = "0.13", default-features = false, features = [
   "cookies",
   "form",
   "json",
   "rustls",
 ] }
-serde = { version = "~1", default-features = false, features = ["derive"] }
+serde      = { version = "~1", default-features = false, features = ["derive"] }
 serde_json = "~1"
-thiserror = "~2"
-tokio = { version = "1", default-features = false, features = ["time"] }
-tracing = { version = "0.1.41", default-features = false, features = [
+thiserror  = "~2"
+tokio      = { version = "1", default-features = false, features = ["time"] }
+tracing    = { version = "0.1.41", default-features = false, features = [
   "attributes",
   "log",
 ] }
@@ -38,25 +33,13 @@ anyhow            = "=1.0.102"
 insta             = "=1.47.2"
 pretty_assertions = "=1.4.1"
 rstest            = "=0.26.1"
-tokio             = { version = "=1.52.1", features = ["macros", "rt-multi-thread"] }
+tokio             = { version = "=1.52.1", features = [
+  "macros",
+  "rt-multi-thread"
+] }
 wiremock          = "=0.6.5"
 
-################################################################################
-## Features
-################################################################################
-
-[features]
-
-################################################################################
-## Lints
-################################################################################
 [lints]
-
-  [lints.rust]
-  future-incompatible = "warn"
-  missing_docs        = "warn"
-  warnings            = "warn"
-
   [lints.clippy]
   # Lower the priority of groups to allow overriding individual lints
   cargo       = { level = "warn", priority = -1 }
@@ -68,9 +51,6 @@ wiremock          = "=0.6.5"
   style       = { level = "warn", priority = -1 }
   suspicious  = { level = "warn", priority = -1 }
 
-  ########################################
-  # Restriction Lints
-  ########################################
   # The restriction group contains lints which Clippy deems as opt-in. I prefer
   # using an opt-out approach.
   blanket-clippy-restriction-lints = "allow"
@@ -92,16 +72,14 @@ wiremock          = "=0.6.5"
   single_char_lifetime_names     = "allow"
   unreachable                    = "allow"
 
-  # TODO: Revisit this one https://github.com/rust-lang/rust-clippy/issues/15111
-  # is resolved.
-  return_and_then = "allow"
-
   # TODO: Revisit this once https://github.com/rust-lang/rust-clippy/issues/14056
   # is resolved.
   panic_in_result_fn = "allow"
 
-  # TODO: Re-enable with the next release following rstest 0.25.0
-  empty_structs_with_brackets = "allow"
+  [lints.rust]
+  future-incompatible = "warn"
+  missing_docs        = "warn"
+  warnings            = "warn"
 
   [lints.rustdoc]
   missing-crate-level-docs = "warn"

@@ -1,0 +1,5 @@
+toml-version = "v1.1.0"
+
+[format.rules]
+indent-sub-tables               = true
+key-value-equals-sign-alignment = true
