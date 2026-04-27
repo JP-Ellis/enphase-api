@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 <!-- markdownlint-disable -->
+## [1.0.1](https://github.com/JP-Ellis/enphase-api/compare/v1.0.0...v1.0.1) - _2026-04-27_
+
+### ⚙️ Miscellaneous Tasks
+
+-   Update to tombi and prek
+
+
 ## [1.0.0](https://github.com/JP-Ellis/enphase-api/releases/tag/v1.0.0) - _2026-03-17_
 
 ### 🚀 Features
