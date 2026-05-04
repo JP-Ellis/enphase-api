@@ -33,7 +33,7 @@ anyhow            = "=1.0.102"
 insta             = "=1.47.2"
 pretty_assertions = "=1.4.1"
 rstest            = "=0.26.1"
-tokio             = { version = "=1.52.1", features = [
+tokio             = { version = "=1.52.2", features = [
   "macros",
   "rt-multi-thread"
 ] }
