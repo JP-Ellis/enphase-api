@@ -30,7 +30,7 @@ tracing    = { version = "0.1.41", default-features = false, features = [
 
 [dev-dependencies]
 anyhow            = "=1.0.102"
-insta             = "=1.47.2"
+insta             = "=1.48.0"
 pretty_assertions = "=1.4.1"
 rstest            = "=0.26.1"
 tokio             = { version = "=1.52.3", features = [
