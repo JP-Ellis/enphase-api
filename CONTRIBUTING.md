@@ -81,10 +81,12 @@ The claiming process is there to help ensure effort is not wasted. Even if you a
 
 ### Prerequisites
 
-1.  Ensure you have [Rust](https://rustup.rs/) installed (latest stable version recommended).
+1.  Ensure you have [Rust](https://rustup.rs/) installed. The toolchain version is pinned in `rust-toolchain.toml`, so `rustup` will pick it up automatically.
 2.  Ensure you have [Git](https://git-scm.com/) installed.
 3.  An Enphase Envoy gateway for testing.
 4.  Optionally, installer credentials to generate tokens from [`entrez.enphaseenergy.com`](https://entrez.enphaseenergy.com/).
+
+Optionally, [`mise`](https://mise.jdx.dev/) can provision the toolchain and the development tools (`cargo-hack`, `cargo-nextest`, `cargo-tarpaulin`, `prek`) for you with `mise install`. The Rust version in `mise.toml` is kept in sync with `rust-toolchain.toml`.
 
 ### Installation
 
