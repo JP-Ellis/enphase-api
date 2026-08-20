@@ -2,7 +2,7 @@
 
 [package]
 name        = "enphase-api"
-version     = "1.0.0"
+version     = "1.0.1"
 description = "Rust client for Enphase/Envoy API"
 readme      = "README.md"
 repository  = "https://github.com/JP-Ellis/enphase-api"
