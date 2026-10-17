@@ -1,0 +1,6 @@
+{
+  "name": "agf-set-profile",
+  "status_code": 200,
+  "headers": ["HTTP/1.1 200 OK\r", "Content-Type: application/json\r", "\r"],
+  "body": "{\"message\":\"/ivp/grest/profile/AUS_A/1.2 'selected_profile': 'AUS_A:1.2' accepted.\"}"
+}

@@ -53,6 +53,33 @@ pub struct DpelResponse {
     pub dynamic_pel_settings: DpelSettings,
 }
 
+/// A single AS/NZS 4777.2 grid profile available on the Envoy.
+///
+/// The device reports more per-profile metadata than is modelled here; only
+/// the identifier needed to select a profile is captured, and unknown JSON
+/// fields are ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
+pub struct GridProfile {
+    /// The profile identifier, in `name:version` form (e.g. `"AUS_A:1.2"`).
+    pub profile_id: String,
+}
+
+/// Response body returned by `GET /installer/agf/index.json`.
+///
+/// Lists the grid profile the Envoy is currently applying and the profiles it
+/// has available to select.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
+pub struct AgfIndexResponse {
+    /// The name of the currently selected profile.
+    pub selected_profile: String,
+    /// The identifier of the currently selected profile (`name:version`).
+    pub selected_profile_id: String,
+    /// The profiles available to select.
+    pub profiles: Vec<GridProfile>,
+}
+
 impl PowerState {
     /// Get the payload array value for this power state.
     pub(crate) fn payload_value(self) -> u8 {

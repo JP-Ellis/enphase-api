@@ -18,7 +18,7 @@ use core::fmt::Display;
 
 use crate::{
     error::Result,
-    models::{DpelResponse, DpelSettings, PowerState, PowerStatusResponse},
+    models::{AgfIndexResponse, DpelResponse, DpelSettings, PowerState, PowerStatusResponse},
 };
 use serde::Serialize;
 use tracing::{debug, instrument};
@@ -495,12 +495,139 @@ impl Envoy {
         let parsed: DpelResponse = serde_json::from_str(&body)?;
         Ok(parsed.dynamic_pel_settings)
     }
+
+    /// Get the grid profiles available on the Envoy.
+    ///
+    /// Reads `/installer/agf/index.json`, which reports the currently selected
+    /// AS/NZS 4777.2 grid profile and the profiles available to select.
+    ///
+    /// # Returns
+    ///
+    /// Returns the [`AgfIndexResponse`] describing the selected and available
+    /// profiles.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use enphase_api::Envoy;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = Envoy::new("envoy.local");
+    /// let index = client.get_grid_profiles().await?;
+    /// println!("active: {}", index.selected_profile_id);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    #[instrument(skip(self), level = "debug")]
+    pub async fn get_grid_profiles(&self) -> Result<AgfIndexResponse> {
+        debug!("Getting grid profiles");
+
+        let endpoint = format!("{}/installer/agf/index.json", self.base_url);
+        debug!("GET {endpoint}");
+
+        let response = self
+            .client
+            .get(&endpoint)
+            .header("Accept", "application/json, text/javascript, */*; q=0.01")
+            .send()
+            .await?;
+
+        let status = response.status();
+        debug!("Status code: {}", status);
+
+        let body = response.text().await?;
+        debug!("Response body: {}", body);
+
+        let index: AgfIndexResponse = serde_json::from_str(&body)?;
+        Ok(index)
+    }
+
+    /// Select an AS/NZS 4777.2 grid profile by identifier.
+    ///
+    /// Sends the profile identifier (in `name:version` form, as listed by
+    /// [`get_grid_profiles`](Self::get_grid_profiles)) to
+    /// `/installer/agf/set_profile.json`. On 8.x firmware only one profile
+    /// persists, so a profile must usually be uploaded with
+    /// [`upload_grid_profile`](Self::upload_grid_profile) immediately before it
+    /// can be selected.
+    ///
+    /// # Arguments
+    ///
+    /// * `profile_id` - The profile identifier, e.g. `"AUS_A:1.2"`.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if the device accepts the profile selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the device responds with a
+    /// non-success status.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use enphase_api::Envoy;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = Envoy::new("envoy.local");
+    /// client.select_grid_profile("AUS_A:1.2").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    #[instrument(skip(self, profile_id), level = "debug")]
+    pub async fn select_grid_profile(&self, profile_id: impl Display) -> Result<()> {
+        debug!("Selecting grid profile");
+
+        let endpoint = format!("{}/installer/agf/set_profile.json", self.base_url);
+        debug!("PUT {endpoint}");
+
+        // The profile id (e.g. "AUS_A:1.2") is interpolated verbatim; the colon
+        // is a valid JSON string character and must round-trip unescaped.
+        let payload = format!(r#"{{"selected_profile":"{profile_id}"}}"#);
+
+        let response = self
+            .client
+            .put(&endpoint)
+            .header(
+                "Content-Type",
+                // As with set_power_state, the Envoy expects this form content
+                // type while the body is actually JSON.
+                "application/x-www-form-urlencoded; charset=UTF-8",
+            )
+            .body(payload)
+            .send()
+            .await?;
+
+        let status = response.status();
+        debug!("Status code: {}", status);
+
+        // The device's exact success status for this endpoint is unverified;
+        // accept any 2xx (pinned against hardware in phase 2).
+        if status.is_success() {
+            debug!("Grid profile selected");
+            return Ok(());
+        }
+
+        Err(crate::error::EnphaseError::InvalidResponse(format!(
+            "Failed to select grid profile: HTTP {status}"
+        )))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::PowerState;
+    use pretty_assertions::assert_eq;
     use wiremock::matchers::{body_string, body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -765,6 +892,79 @@ mod tests {
         let client = test_envoy(&mock_server);
 
         let result = client.set_export_limit(0.0).await;
+
+        assert!(result.is_err(), "HTTP 401 should produce an error");
+        if let Err(err) = result {
+            assert!(
+                matches!(err, crate::error::EnphaseError::InvalidResponse(_)),
+                "Error should be InvalidResponse type"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_grid_profiles_parses() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/installer/agf/index.json"))
+            .respond_with(fixture_response("envoy", "agf-index"))
+            .mount(&mock_server)
+            .await;
+
+        let client = test_envoy(&mock_server);
+
+        let index = client
+            .get_grid_profiles()
+            .await
+            .expect("get_grid_profiles should succeed");
+
+        assert_eq!(
+            index.selected_profile_id, "AUS_A:1.2",
+            "selected_profile_id should match the fixture"
+        );
+        assert_eq!(index.profiles.len(), 2, "there should be two profiles");
+    }
+
+    #[tokio::test]
+    async fn select_grid_profile_body() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/installer/agf/set_profile.json"))
+            .and(header(
+                "Content-Type",
+                "application/x-www-form-urlencoded; charset=UTF-8",
+            ))
+            .and(body_string(r#"{"selected_profile":"AUS_A:1.2"}"#))
+            .respond_with(fixture_response("envoy", "agf-set-profile"))
+            .mount(&mock_server)
+            .await;
+
+        let client = test_envoy(&mock_server);
+
+        let result = client.select_grid_profile("AUS_A:1.2").await;
+
+        assert!(
+            result.is_ok(),
+            "select_grid_profile should succeed. Error: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn select_grid_profile_http_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("PUT"))
+            .and(path("/installer/agf/set_profile.json"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mock_server)
+            .await;
+
+        let client = test_envoy(&mock_server);
+
+        let result = client.select_grid_profile("AUS_A:1.2").await;
 
         assert!(result.is_err(), "HTTP 401 should produce an error");
         if let Err(err) = result {
