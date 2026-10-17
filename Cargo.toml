@@ -17,6 +17,7 @@ reqwest    = { version = "0.13", default-features = false, features = [
   "cookies",
   "form",
   "json",
+  "multipart",
   "rustls",
 ] }
 serde      = { version = "~1", default-features = false, features = ["derive"] }

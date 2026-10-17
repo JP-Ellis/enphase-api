@@ -148,3 +148,48 @@ async fn authenticate_and_get_grid_profiles() -> Result<(), Box<dyn core::error:
 
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "Requires local Envoy device, Enphase credentials, and ENVOY_PROFILE_PACKAGE"]
+async fn authenticate_and_upload_grid_profile() -> Result<(), Box<dyn core::error::Error>> {
+    has_credentials()?;
+
+    // The profile package path is required for this test; skip (pass) if unset.
+    let Ok(package_path) = std::env::var("ENVOY_PROFILE_PACKAGE") else {
+        println!("ENVOY_PROFILE_PACKAGE not set; skipping");
+        return Ok(());
+    };
+
+    let envoy_host = std::env::var("ENVOY_HOST")?;
+    let envoy_name = std::env::var("ENVOY_NAME")?;
+    let envoy_serial = std::env::var("ENVOY_SERIAL_NUMBER")?;
+
+    // Step 1: Create Entrez client and generate JWT token
+    let entrez = Entrez::default();
+    entrez.login_with_env().await?;
+    let token = entrez
+        .generate_token(&envoy_name, &envoy_serial, true)
+        .await?;
+    println!("Generated JWT token for authentication");
+
+    // Step 2: Create Envoy client and authenticate with the token
+    let envoy = Envoy::new(&envoy_host);
+    envoy.authenticate(&token).await?;
+    println!("Successfully authenticated with Envoy device");
+
+    // Step 3: Upload the profile package, then select it.
+    //
+    // This is the offline profile-switch path (spec phase 2): on 8.x only one
+    // profile persists, so a package must be uploaded immediately before it can
+    // be selected. ENVOY_PROFILE_ID, if set, is the id to select afterwards.
+    let package = std::fs::read(&package_path)?;
+    envoy.upload_grid_profile(package).await?;
+    println!("Uploaded grid profile package from {package_path}");
+
+    if let Ok(profile_id) = std::env::var("ENVOY_PROFILE_ID") {
+        envoy.select_grid_profile(&profile_id).await?;
+        println!("Selected grid profile {profile_id}");
+    }
+
+    Ok(())
+}
