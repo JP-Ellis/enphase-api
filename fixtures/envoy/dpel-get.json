@@ -1,0 +1,6 @@
+{
+  "name": "dpel-get",
+  "status_code": 200,
+  "headers": ["HTTP/1.1 200 OK\r", "Content-Type: application/json\r", "\r"],
+  "body": "{\"dynamic_pel_settings\":{\"enable\":true,\"export_limit\":true,\"limit_value_W\":0.0,\"slew_rate\":100.0,\"enable_dynamic_limiting\":false},\"filename\":\"site_settings\",\"version\":\"00.00.01\"}"
+}

@@ -2,7 +2,7 @@
 //!
 //! This module contains data models used by the Enphase API client.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Power state for an inverter or device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -21,6 +21,36 @@ pub enum PowerState {
 pub struct PowerStatusResponse {
     /// Whether power is forced off.
     pub power_forced_off: bool,
+}
+
+/// Dynamic Power Export Limit (DPEL) settings for the Envoy.
+///
+/// Mirrors the `dynamic_pel_settings` object the Envoy exposes at
+/// `/ivp/ss/dpel`. When an export limit is enforced the device closes a loop
+/// on the consumption meter, capping how much power is fed back to the grid.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DpelSettings {
+    /// Whether dynamic power export limiting is enabled.
+    pub enable: bool,
+    /// Whether an export limit is enforced.
+    pub export_limit: bool,
+    /// The export limit, in watts (`0.0` means full self-consumption).
+    #[serde(rename = "limit_value_W")]
+    pub limit_value_w: f64,
+    /// The slew (ramp) rate the device applies when changing output, in watts
+    /// per second.
+    pub slew_rate: f64,
+    /// Whether dynamic limiting (meter-driven adjustment) is enabled.
+    pub enable_dynamic_limiting: bool,
+}
+
+/// Response body returned by `GET /ivp/ss/dpel`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[non_exhaustive]
+pub struct DpelResponse {
+    /// The current dynamic power export limit settings.
+    pub dynamic_pel_settings: DpelSettings,
 }
 
 impl PowerState {
