@@ -621,6 +621,73 @@ impl Envoy {
             "Failed to select grid profile: HTTP {status}"
         )))
     }
+
+    /// Upload a grid-profile package to the Envoy.
+    ///
+    /// Sends the profile package bytes to
+    /// `/installer/agf/upload_profile_package` as a multipart form with the
+    /// single part named `file`. On 8.x firmware only one profile persists, so
+    /// a package must usually be uploaded immediately before the matching
+    /// profile is applied with
+    /// [`select_grid_profile`](Self::select_grid_profile).
+    ///
+    /// # Arguments
+    ///
+    /// * `package` - The raw profile-package bytes to upload.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if the device accepts the upload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the device responds with a
+    /// non-success status.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use enphase_api::Envoy;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = Envoy::new("envoy.local");
+    /// let package = std::fs::read("AUS_A_1.2.json")?;
+    /// client.upload_grid_profile(package).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    #[instrument(skip(self, package), level = "debug")]
+    pub async fn upload_grid_profile(&self, package: Vec<u8>) -> Result<()> {
+        debug!(bytes = package.len(), "Uploading grid profile package");
+
+        let endpoint = format!("{}/installer/agf/upload_profile_package", self.base_url);
+        debug!("POST {endpoint}");
+
+        // The device requires the part to be named `file`; a wrong name fails
+        // silently on-device.
+        let form = reqwest::multipart::Form::new().part(
+            "file",
+            reqwest::multipart::Part::bytes(package).file_name("grid_profile.json"),
+        );
+
+        let response = self.client.post(&endpoint).multipart(form).send().await?;
+
+        let status = response.status();
+        debug!("Status code: {}", status);
+
+        // The device's exact success status for this endpoint is unverified;
+        // accept any 2xx (pinned against hardware in phase 2).
+        if status.is_success() {
+            debug!("Grid profile package uploaded");
+            return Ok(());
+        }
+
+        Err(crate::error::EnphaseError::InvalidResponse(format!(
+            "Failed to upload grid profile package: HTTP {status}"
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -965,6 +1032,53 @@ mod tests {
         let client = test_envoy(&mock_server);
 
         let result = client.select_grid_profile("AUS_A:1.2").await;
+
+        assert!(result.is_err(), "HTTP 401 should produce an error");
+        if let Err(err) = result {
+            assert!(
+                matches!(err, crate::error::EnphaseError::InvalidResponse(_)),
+                "Error should be InvalidResponse type"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_grid_profile_sends_file_part() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/installer/agf/upload_profile_package"))
+            // A wrong multipart field name silently fails on-device, so assert
+            // the `file` part is present in the request body.
+            .and(body_string_contains("name=\"file\""))
+            .respond_with(fixture_response("envoy", "agf-upload"))
+            .mount(&mock_server)
+            .await;
+
+        let client = test_envoy(&mock_server);
+
+        let result = client.upload_grid_profile(b"PROFILE_BYTES".to_vec()).await;
+
+        assert!(
+            result.is_ok(),
+            "upload_grid_profile should succeed. Error: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_grid_profile_http_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/installer/agf/upload_profile_package"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mock_server)
+            .await;
+
+        let client = test_envoy(&mock_server);
+
+        let result = client.upload_grid_profile(b"PROFILE_BYTES".to_vec()).await;
 
         assert!(result.is_err(), "HTTP 401 should produce an error");
         if let Err(err) = result {
