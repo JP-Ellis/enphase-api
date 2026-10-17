@@ -1,0 +1,6 @@
+{
+  "name": "agf-index",
+  "status_code": 200,
+  "headers": ["HTTP/1.1 200 OK\r", "Content-Type: application/json\r", "\r"],
+  "body": "{\"selected_profile\":\"AUS_A\",\"selected_profile_id\":\"AUS_A:1.2\",\"profiles\":[{\"profile_id\":\"AUS_A:1.2\"},{\"profile_id\":\"AUS_B:1.2\"}]}"
+}
