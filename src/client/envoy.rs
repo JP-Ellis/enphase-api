@@ -482,7 +482,7 @@ impl Envoy {
         let response = self
             .client
             .get(&endpoint)
-            .header("Accept", "application/json")
+            .header("Accept", "application/json, text/javascript, */*; q=0.01")
             .send()
             .await?;
 
@@ -590,9 +590,11 @@ impl Envoy {
         let endpoint = format!("{}/installer/agf/set_profile.json", self.base_url);
         debug!("PUT {endpoint}");
 
-        // The profile id (e.g. "AUS_A:1.2") is interpolated verbatim; the colon
-        // is a valid JSON string character and must round-trip unescaped.
-        let payload = format!(r#"{{"selected_profile":"{profile_id}"}}"#);
+        // Serialize the body so the id is JSON-escaped. For a normal id (e.g.
+        // "AUS_A:1.2") this is byte-identical to the literal form — the colon
+        // round-trips unescaped — while a quote or backslash is escaped rather
+        // than producing malformed JSON.
+        let payload = serde_json::json!({ "selected_profile": profile_id.to_string() }).to_string();
 
         let response = self
             .client
@@ -859,6 +861,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/ivp/ss/dpel"))
+            .and(header("Content-Type", "application/json"))
             .and(body_string(
                 r#"{"dynamic_pel_settings":{"enable":true,"export_limit":true,"limit_value_W":0.0,"slew_rate":100.0,"enable_dynamic_limiting":false},"filename":"site_settings","version":"00.00.01"}"#,
             ))
@@ -1040,6 +1043,30 @@ mod tests {
                 "Error should be InvalidResponse type"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn select_grid_profile_escapes_special_chars() {
+        let mock_server = MockServer::start().await;
+
+        // An id containing a quote must be JSON-escaped, not interpolated raw;
+        // a raw interpolation would emit malformed JSON.
+        Mock::given(method("PUT"))
+            .and(path("/installer/agf/set_profile.json"))
+            .and(body_string(r#"{"selected_profile":"he\"llo"}"#))
+            .respond_with(fixture_response("envoy", "agf-set-profile"))
+            .mount(&mock_server)
+            .await;
+
+        let client = test_envoy(&mock_server);
+
+        let result = client.select_grid_profile(r#"he"llo"#).await;
+
+        assert!(
+            result.is_ok(),
+            "special characters in the profile id must be JSON-escaped. Error: {:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]
