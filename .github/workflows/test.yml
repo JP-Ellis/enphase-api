@@ -184,7 +184,7 @@ jobs:
           tool: cargo-tarpaulin
 
       - name: Run cargo tarpaulin
-        run: cargo tarpaulin --out Xml
+        run: cargo tarpaulin --workspace --out Xml
 
       - name: Upload Rust coverage artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
