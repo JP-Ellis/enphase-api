@@ -122,7 +122,14 @@ async fn publish_discovery(
             Vec::new()
         }
     };
-    for message in discovery_configs(topics, NODE_ID, &profile_options) {
+    // The configurable cap is threaded through in the Task-7 run-loop rewrite;
+    // until then the default keeps this call compiling.
+    for message in discovery_configs(
+        topics,
+        NODE_ID,
+        &profile_options,
+        crate::discovery::DEFAULT_EXPORT_LIMIT_MAX,
+    ) {
         client
             .publish(message.topic, QoS::AtLeastOnce, true, message.payload)
             .await?;

@@ -8,6 +8,10 @@ use serde_json::json;
 
 use crate::topics::BridgeTopics;
 
+/// The default export-limit `number` maximum, in watts: the owner's regulatory
+/// cap. Also the CLI default for `--export-limit-max`.
+pub(crate) const DEFAULT_EXPORT_LIMIT_MAX: f64 = 5_000.0;
+
 /// A single retained MQTT discovery message: a config topic and its JSON
 /// payload.
 #[derive(Debug, Clone)]
@@ -36,10 +40,30 @@ fn device_block() -> serde_json::Value {
     })
 }
 
-/// Build the four Home Assistant discovery messages for the bridge entities.
+/// Build the per-entity availability block for a control entity.
 ///
-/// The entities are, in order: panels switch, zero-export switch, export-limit
-/// number, and grid-profile select.
+/// Each control entity lists two availability topics — the shared bridge-liveness
+/// Last Will and its own per-entity topic — with `availability_mode: "all"`, so
+/// it shows available only when the bridge is alive *and* the entity's own reads
+/// are succeeding.
+///
+/// # Arguments
+///
+/// * `bridge` - The bridge-liveness (Last Will) availability topic.
+/// * `entity` - The entity's own per-entity availability topic.
+///
+/// # Returns
+///
+/// A `(availability, availability_mode)` JSON pair to splice into a payload.
+fn layered_availability(bridge: &str, entity: &str) -> serde_json::Value {
+    json!([{ "topic": bridge }, { "topic": entity }])
+}
+
+/// Build the Home Assistant discovery messages for the bridge entities.
+///
+/// The entities are, in order: panels switch, export-limit number, grid-profile
+/// select, and the reachability binary sensor. There is no zero-export entity;
+/// [`zero_export_discovery_clear`] removes any that an earlier version announced.
 ///
 /// # Arguments
 ///
@@ -47,6 +71,8 @@ fn device_block() -> serde_json::Value {
 /// * `node_id` - The discovery node id embedded in each config topic.
 /// * `profile_options` - The grid-profile ids offered by the `select` entity;
 ///   may be empty when the device reports no profiles.
+/// * `export_limit_max` - The export-limit `number`'s maximum, in watts (the
+///   owner's regulatory cap).
 ///
 /// # Returns
 ///
@@ -57,6 +83,7 @@ pub fn discovery_configs(
     topics: &BridgeTopics,
     node_id: &str,
     profile_options: &[String],
+    export_limit_max: f64,
 ) -> Vec<DiscoveryMessage> {
     let device = device_block();
 
@@ -65,19 +92,8 @@ pub fn discovery_configs(
         "unique_id": "enphase_bridge_panels",
         "command_topic": topics.panels_command,
         "state_topic": topics.panels_state,
-        "availability_topic": topics.availability,
-        "payload_on": "ON",
-        "payload_off": "OFF",
-        "optimistic": false,
-        "device": device.clone(),
-    });
-
-    let zero_export = json!({
-        "name": "Zero export",
-        "unique_id": "enphase_bridge_zero_export",
-        "command_topic": topics.zero_export_command,
-        "state_topic": topics.zero_export_state,
-        "availability_topic": topics.availability,
+        "availability": layered_availability(&topics.availability, &topics.panels_availability),
+        "availability_mode": "all",
         "payload_on": "ON",
         "payload_off": "OFF",
         "optimistic": false,
@@ -89,9 +105,10 @@ pub fn discovery_configs(
         "unique_id": "enphase_bridge_export_limit",
         "command_topic": topics.export_limit_command,
         "state_topic": topics.export_limit_state,
-        "availability_topic": topics.availability,
+        "availability": layered_availability(&topics.availability, &topics.export_limit_availability),
+        "availability_mode": "all",
         "min": 0_i64,
-        "max": 20000_i64,
+        "max": export_limit_max,
         "step": 100_i64,
         "unit_of_measurement": "W",
         "mode": "box",
@@ -103,16 +120,28 @@ pub fn discovery_configs(
         "unique_id": "enphase_bridge_grid_profile",
         "command_topic": topics.grid_profile_command,
         "state_topic": topics.grid_profile_state,
-        "availability_topic": topics.availability,
+        "availability": layered_availability(&topics.availability, &topics.grid_profile_availability),
+        "availability_mode": "all",
         "options": profile_options,
+        "device": device.clone(),
+    });
+
+    let reachability = json!({
+        "name": "Reachability",
+        "unique_id": "enphase_bridge_reachability",
+        "device_class": "connectivity",
+        "state_topic": topics.reachability_state,
+        "availability_topic": topics.availability,
+        "payload_on": "ON",
+        "payload_off": "OFF",
         "device": device,
     });
 
     [
         ("switch", "panels", panels),
-        ("switch", "zero_export", zero_export),
         ("number", "export_limit", export_limit),
         ("select", "grid_profile", grid_profile),
+        ("binary_sensor", "reachability", reachability),
     ]
     .into_iter()
     .map(|(component, object, payload)| DiscoveryMessage {
@@ -120,6 +149,28 @@ pub fn discovery_configs(
         payload: payload.to_string(),
     })
     .collect()
+}
+
+/// Build the retained message that removes the retired zero-export entity.
+///
+/// An earlier bridge version announced a zero-export `switch`; publishing an
+/// empty retained payload to its discovery config topic tells Home Assistant to
+/// forget it after upgrade.
+///
+/// # Arguments
+///
+/// * `node_id` - The discovery node id embedded in the config topic.
+///
+/// # Returns
+///
+/// A [`DiscoveryMessage`] with the zero-export config topic and an empty payload.
+#[inline]
+#[must_use]
+pub fn zero_export_discovery_clear(node_id: &str) -> DiscoveryMessage {
+    DiscoveryMessage {
+        topic: format!("homeassistant/switch/{node_id}/zero_export/config"),
+        payload: String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -131,25 +182,88 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn discovery_has_four_entities() {
+    fn discovery_has_four_entities_without_zero_export() {
         let topics = BridgeTopics::new("enphase");
-        let msgs = discovery_configs(&topics, "bridge", &["AUS_A:1.2".to_owned()]);
-        assert_eq!(msgs.len(), 4);
-        let expected = [
-            "homeassistant/switch/bridge/panels/config",
-            "homeassistant/switch/bridge/zero_export/config",
-            "homeassistant/number/bridge/export_limit/config",
-            "homeassistant/select/bridge/grid_profile/config",
-        ];
-        for (msg, want) in msgs.iter().zip(expected) {
-            assert_eq!(msg.topic, want);
-        }
+        let msgs = discovery_configs(&topics, "bridge", &["AUS_A:1.2".to_owned()], 5000.0);
+        let topics_seen: Vec<&str> = msgs.iter().map(|m| m.topic.as_str()).collect();
+        assert_eq!(
+            topics_seen,
+            vec![
+                "homeassistant/switch/bridge/panels/config",
+                "homeassistant/number/bridge/export_limit/config",
+                "homeassistant/select/bridge/grid_profile/config",
+                "homeassistant/binary_sensor/bridge/reachability/config",
+            ]
+        );
+    }
+
+    #[test]
+    fn control_entities_list_two_availability_topics_all_mode() {
+        let topics = BridgeTopics::new("enphase");
+        let msgs = discovery_configs(&topics, "bridge", &[], 5000.0);
+        let panels: serde_json::Value =
+            serde_json::from_str(&msgs.first().expect("panels message").payload).expect("json");
+        assert_eq!(
+            panels
+                .pointer("/availability_mode")
+                .and_then(serde_json::Value::as_str),
+            Some("all")
+        );
+        let topics_listed: Vec<&str> = panels
+            .pointer("/availability")
+            .and_then(serde_json::Value::as_array)
+            .expect("availability array")
+            .iter()
+            .filter_map(|a| a.pointer("/topic").and_then(|t| t.as_str()))
+            .collect();
+        assert_eq!(
+            topics_listed,
+            vec!["enphase/availability", "enphase/panels/availability"]
+        );
+    }
+
+    #[test]
+    fn export_limit_max_comes_from_argument() {
+        let topics = BridgeTopics::new("enphase");
+        let msgs = discovery_configs(&topics, "bridge", &[], 5000.0);
+        let number: serde_json::Value =
+            serde_json::from_str(&msgs.get(1).expect("export-limit message").payload)
+                .expect("json");
+        assert_eq!(
+            number.pointer("/max").and_then(serde_json::Value::as_f64),
+            Some(5_000.0_f64)
+        );
+    }
+
+    #[test]
+    fn reachability_is_connectivity_binary_sensor() {
+        let topics = BridgeTopics::new("enphase");
+        let msgs = discovery_configs(&topics, "bridge", &[], 5000.0);
+        let rs: serde_json::Value =
+            serde_json::from_str(&msgs.get(3).expect("reachability message").payload)
+                .expect("json");
+        assert_eq!(
+            rs.pointer("/device_class")
+                .and_then(serde_json::Value::as_str),
+            Some("connectivity")
+        );
+        assert_eq!(
+            rs.pointer("/state_topic")
+                .and_then(serde_json::Value::as_str),
+            Some("enphase/reachability/state")
+        );
+        // Reachability rides only the bridge LWT, so it stays readable when controls drop out.
+        assert_eq!(
+            rs.pointer("/availability_topic")
+                .and_then(serde_json::Value::as_str),
+            Some("enphase/availability")
+        );
     }
 
     #[test]
     fn discovery_fields_are_wired() {
         let topics = BridgeTopics::new("enphase");
-        let msgs = discovery_configs(&topics, "bridge", &["AUS_A:1.2".to_owned()]);
+        let msgs = discovery_configs(&topics, "bridge", &["AUS_A:1.2".to_owned()], 5000.0);
         let panels = msgs.first().expect("panels message present");
         let value: serde_json::Value =
             serde_json::from_str(&panels.payload).expect("payload is valid JSON");
@@ -176,10 +290,17 @@ mod tests {
     #[test]
     fn discovery_select_options_empty_ok() {
         let topics = BridgeTopics::new("enphase");
-        let msgs = discovery_configs(&topics, "bridge", &[]);
-        let select = msgs.get(3).expect("select message present");
+        let msgs = discovery_configs(&topics, "bridge", &[], 5000.0);
+        let select = msgs.get(2).expect("select message present");
         let value: serde_json::Value =
             serde_json::from_str(&select.payload).expect("payload is valid JSON");
         assert_eq!(value.pointer("/options"), Some(&serde_json::json!([])));
+    }
+
+    #[test]
+    fn zero_export_clear_targets_old_topic() {
+        let msg = zero_export_discovery_clear("bridge");
+        assert_eq!(msg.topic, "homeassistant/switch/bridge/zero_export/config");
+        assert_eq!(msg.payload, "");
     }
 }
