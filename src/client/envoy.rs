@@ -38,6 +38,31 @@ struct DpelRequest {
     version: &'static str,
 }
 
+/// Map an HTTP response status to a [`Result`].
+///
+/// Returns `Ok(())` for any 2xx status, [`EnphaseError::Unauthorized`] for
+/// HTTP 401 (so a caller holding credentials can re-authenticate and retry),
+/// and [`EnphaseError::InvalidResponse`] for any other non-success status.
+///
+/// # Arguments
+///
+/// * `status` - The HTTP status returned by the device.
+/// * `context` - A short description of the operation, used in the error
+///   message (e.g. `"set power state"`).
+fn check_status(status: reqwest::StatusCode, context: &str) -> Result<()> {
+    if status.is_success() {
+        return Ok(());
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(crate::error::EnphaseError::Unauthorized(format!(
+            "Failed to {context}: HTTP {status}"
+        )));
+    }
+    Err(crate::error::EnphaseError::InvalidResponse(format!(
+        "Failed to {context}: HTTP {status}"
+    )))
+}
+
 /// Main client for the Enphase Envoy local gateway.
 ///
 /// This client provides access to local solar production, consumption, and inverter data.
@@ -249,15 +274,10 @@ impl Envoy {
         let status = response.status();
         debug!("Status code: {}", status);
 
-        // The endpoint returns 204 No Content on success
-        if status == 204 {
-            debug!("Power state set successfully");
-            return Ok(());
-        }
-
-        Err(crate::error::EnphaseError::InvalidResponse(format!(
-            "Failed to set power state: HTTP {status}"
-        )))
+        // The endpoint returns 204 No Content on success (any 2xx is accepted).
+        check_status(status, "set power state")?;
+        debug!("Power state set successfully");
+        Ok(())
     }
 
     /// Get the power state of an inverter or device.
@@ -308,6 +328,8 @@ impl Envoy {
         let status_code = response.status();
         debug!("Status code: {}", status_code);
 
+        check_status(status_code, "get power state")?;
+
         let body = response.text().await?;
         debug!("Response body: {}", body);
 
@@ -347,14 +369,9 @@ impl Envoy {
 
         // The device's exact success status for this endpoint is unverified
         // (the spec documents the body, not the code); accept any 2xx.
-        if status.is_success() {
-            debug!("DPEL settings accepted");
-            return Ok(());
-        }
-
-        Err(crate::error::EnphaseError::InvalidResponse(format!(
-            "Failed to set DPEL settings: HTTP {status}"
-        )))
+        check_status(status, "set DPEL settings")?;
+        debug!("DPEL settings accepted");
+        Ok(())
     }
 
     /// Set the grid export limit (DPEL / zero-export).
@@ -489,6 +506,8 @@ impl Envoy {
         let status = response.status();
         debug!("Status code: {}", status);
 
+        check_status(status, "get DPEL settings")?;
+
         let body = response.text().await?;
         debug!("Response body: {}", body);
 
@@ -540,6 +559,8 @@ impl Envoy {
 
         let status = response.status();
         debug!("Status code: {}", status);
+
+        check_status(status, "get grid profiles")?;
 
         let body = response.text().await?;
         debug!("Response body: {}", body);
@@ -614,14 +635,9 @@ impl Envoy {
 
         // The device's exact success status for this endpoint is unverified;
         // accept any 2xx (pinned against hardware in phase 2).
-        if status.is_success() {
-            debug!("Grid profile selected");
-            return Ok(());
-        }
-
-        Err(crate::error::EnphaseError::InvalidResponse(format!(
-            "Failed to select grid profile: HTTP {status}"
-        )))
+        check_status(status, "select grid profile")?;
+        debug!("Grid profile selected");
+        Ok(())
     }
 
     /// Upload a grid-profile package to the Envoy.
@@ -681,14 +697,9 @@ impl Envoy {
 
         // The device's exact success status for this endpoint is unverified;
         // accept any 2xx (pinned against hardware in phase 2).
-        if status.is_success() {
-            debug!("Grid profile package uploaded");
-            return Ok(());
-        }
-
-        Err(crate::error::EnphaseError::InvalidResponse(format!(
-            "Failed to upload grid profile package: HTTP {status}"
-        )))
+        check_status(status, "upload grid profile package")?;
+        debug!("Grid profile package uploaded");
+        Ok(())
     }
 }
 
@@ -966,8 +977,8 @@ mod tests {
         assert!(result.is_err(), "HTTP 401 should produce an error");
         if let Err(err) = result {
             assert!(
-                matches!(err, crate::error::EnphaseError::InvalidResponse(_)),
-                "Error should be InvalidResponse type"
+                matches!(err, crate::error::EnphaseError::Unauthorized(_)),
+                "Error should be Unauthorized type"
             );
         }
     }
@@ -1039,8 +1050,8 @@ mod tests {
         assert!(result.is_err(), "HTTP 401 should produce an error");
         if let Err(err) = result {
             assert!(
-                matches!(err, crate::error::EnphaseError::InvalidResponse(_)),
-                "Error should be InvalidResponse type"
+                matches!(err, crate::error::EnphaseError::Unauthorized(_)),
+                "Error should be Unauthorized type"
             );
         }
     }
@@ -1110,8 +1121,77 @@ mod tests {
         assert!(result.is_err(), "HTTP 401 should produce an error");
         if let Err(err) = result {
             assert!(
-                matches!(err, crate::error::EnphaseError::InvalidResponse(_)),
-                "Error should be InvalidResponse type"
+                matches!(err, crate::error::EnphaseError::Unauthorized(_)),
+                "Error should be Unauthorized type"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_power_state_unauthorized() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/ivp/mod/603980032/mode/power"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mock_server)
+            .await;
+
+        let client = test_envoy(&mock_server);
+
+        let result = client.get_power_state("603980032").await;
+
+        assert!(result.is_err(), "HTTP 401 should produce an error");
+        if let Err(err) = result {
+            assert!(
+                matches!(err, crate::error::EnphaseError::Unauthorized(_)),
+                "Error should be Unauthorized type, got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_dpel_unauthorized() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/ivp/ss/dpel"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mock_server)
+            .await;
+
+        let client = test_envoy(&mock_server);
+
+        let result = client.get_dpel().await;
+
+        assert!(result.is_err(), "HTTP 401 should produce an error");
+        if let Err(err) = result {
+            assert!(
+                matches!(err, crate::error::EnphaseError::Unauthorized(_)),
+                "Error should be Unauthorized type, got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_grid_profiles_unauthorized() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/installer/agf/index.json"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mock_server)
+            .await;
+
+        let client = test_envoy(&mock_server);
+
+        let result = client.get_grid_profiles().await;
+
+        assert!(result.is_err(), "HTTP 401 should produce an error");
+        if let Err(err) = result {
+            assert!(
+                matches!(err, crate::error::EnphaseError::Unauthorized(_)),
+                "Error should be Unauthorized type, got {err:?}"
             );
         }
     }

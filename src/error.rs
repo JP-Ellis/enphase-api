@@ -15,6 +15,16 @@ pub enum EnphaseError {
     #[error("Invalid API response: {0}")]
     InvalidResponse(String),
 
+    /// The device rejected the request with HTTP 401 Unauthorized.
+    ///
+    /// Distinct from [`AuthenticationFailed`](Self::AuthenticationFailed) (which
+    /// covers a failed token-validation handshake): this signals that an
+    /// otherwise well-formed control or read request was refused for lack of a
+    /// valid session, so a caller holding credentials can re-authenticate and
+    /// retry.
+    #[error("Unauthorized: {0}")]
+    Unauthorized(String),
+
     /// Authentication failed.
     #[error("Authentication failed: {0}")]
     AuthenticationFailed(String),
