@@ -1769,6 +1769,7 @@ mod tests {
             .await;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn token_cache_written_0600() {
         use std::os::unix::fs::PermissionsExt as _;
