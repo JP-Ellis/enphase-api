@@ -12,6 +12,7 @@
 
 use core::time::Duration;
 
+use async_trait::async_trait;
 use rumqttc::{AsyncClient, Event, LastWill, MqttOptions, Packet, QoS};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
@@ -26,6 +27,38 @@ use crate::discovery::{discovery_configs, zero_export_discovery_clear};
 use crate::payload::{Command, parse_command};
 use crate::state::{apply_command, poll_once};
 use crate::topics::BridgeTopics;
+
+/// The publish seam the device worker writes through.
+///
+/// Behind a trait so the worker's publish behaviour — above all, that it stays
+/// silent while the broker is disconnected — can be unit-tested with a mock,
+/// without a live broker. [`AsyncClient`] is the real implementation; every
+/// publish is `QoS::AtLeastOnce`.
+#[cfg_attr(test, mockall::automock)]
+#[async_trait(?Send)]
+pub(crate) trait MqttPublisher {
+    /// Publish one message.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The topic to publish to.
+    /// * `retain` - Whether the broker retains the message.
+    /// * `payload` - The payload to publish.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client rejects the publish.
+    async fn publish(&self, topic: String, retain: bool, payload: String) -> anyhow::Result<()>;
+}
+
+#[async_trait(?Send)]
+impl MqttPublisher for AsyncClient {
+    #[inline]
+    async fn publish(&self, topic: String, retain: bool, payload: String) -> anyhow::Result<()> {
+        AsyncClient::publish(self, topic, QoS::AtLeastOnce, retain, payload).await?;
+        Ok(())
+    }
+}
 
 /// The discovery node id embedded in the HA config topics.
 const NODE_ID: &str = "enphase_bridge";
@@ -46,6 +79,10 @@ const COMMAND_CAPACITY: usize = 64;
 enum WorkerMsg {
     /// The broker connection was (re)established.
     Connected,
+    /// The broker connection was lost; the worker must stop publishing until the
+    /// next [`Connected`](WorkerMsg::Connected), or its publishes pile up in the
+    /// client queue that `poll()` cannot drain while disconnected.
+    Disconnected,
     /// A command arrived on a command topic.
     Command(Command),
 }
@@ -127,15 +164,10 @@ pub fn offline_reset_messages(topics: &BridgeTopics) -> Vec<PublishMessage> {
 ///
 /// * `client` - The connected MQTT client.
 /// * `messages` - The messages to publish.
-async fn publish_all(client: &AsyncClient, messages: Vec<PublishMessage>) {
+async fn publish_all(client: &impl MqttPublisher, messages: Vec<PublishMessage>) {
     for message in messages {
         if let Err(err) = client
-            .publish(
-                message.topic,
-                QoS::AtLeastOnce,
-                message.retain,
-                message.payload,
-            )
+            .publish(message.topic, message.retain, message.payload)
             .await
         {
             warn!("publish failed: {err}");
@@ -152,16 +184,13 @@ async fn publish_all(client: &AsyncClient, messages: Vec<PublishMessage>) {
 /// * `profile_options` - The grid-profile ids for the `select` entity.
 /// * `export_limit_max` - The export-limit `number`'s maximum, in watts.
 async fn publish_discovery(
-    client: &AsyncClient,
+    client: &impl MqttPublisher,
     topics: &BridgeTopics,
     profile_options: &[String],
     export_limit_max: f64,
 ) {
     for message in discovery_configs(topics, NODE_ID, profile_options, export_limit_max) {
-        if let Err(err) = client
-            .publish(message.topic, QoS::AtLeastOnce, true, message.payload)
-            .await
-        {
+        if let Err(err) = client.publish(message.topic, true, message.payload).await {
             warn!("discovery publish failed: {err}");
         }
     }
@@ -174,14 +203,9 @@ async fn publish_discovery(
 /// * `client` - The connected MQTT client.
 /// * `topics` - The bridge's topic layout.
 /// * `payload` - `online` or `offline`.
-async fn publish_availability(client: &AsyncClient, topics: &BridgeTopics, payload: &str) {
+async fn publish_availability(client: &impl MqttPublisher, topics: &BridgeTopics, payload: &str) {
     if let Err(err) = client
-        .publish(
-            topics.availability.clone(),
-            QoS::AtLeastOnce,
-            true,
-            payload.to_owned(),
-        )
+        .publish(topics.availability.clone(), true, payload.to_owned())
         .await
     {
         warn!("availability publish failed: {err}");
@@ -332,10 +356,12 @@ async fn mqtt_driver(
     export_limit_max: f64,
 ) {
     let mut backoff = MIN_BACKOFF;
+    let mut connected = false;
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                 backoff = MIN_BACKOFF;
+                connected = true;
                 info!("connected to MQTT broker; subscribing to command topics");
                 for topic in [
                     &topics.panels_command,
@@ -360,6 +386,15 @@ async fn mqtt_driver(
             }
             Ok(_) => {}
             Err(err) => {
+                // Tell the worker to stop publishing, once per disconnect: a full
+                // client queue that `poll()` cannot drain while down would
+                // otherwise wedge both tasks on the next reconnect.
+                if connected {
+                    connected = false;
+                    if tx.send(WorkerMsg::Disconnected).await.is_err() {
+                        return;
+                    }
+                }
                 warn!("MQTT connection error: {err}; reconnecting in {backoff:?}");
                 tokio::time::sleep(backoff).await;
                 backoff = next_backoff(backoff);
@@ -383,7 +418,7 @@ async fn mqtt_driver(
 /// * `cache` - The state cache to seed from the first poll.
 /// * `export_limit_max` - The export-limit `number`'s maximum, in watts.
 async fn on_connect(
-    client: &AsyncClient,
+    client: &impl MqttPublisher,
     controls: &impl EnphaseControls,
     topics: &BridgeTopics,
     cache: &mut StateCache,
@@ -399,6 +434,38 @@ async fn on_connect(
     poll_once(controls, cache).await;
     publish_discovery(client, topics, cache.profile_options(), export_limit_max).await;
     publish_all(client, cache.messages(topics)).await;
+}
+
+/// Poll the device once, publishing the refreshed state only when connected.
+///
+/// The poll always runs so the cache tracks the device, but publishing is gated on
+/// the broker connection: while disconnected, `eventloop.poll()` cannot drain the
+/// client's request queue, so publishing anyway would fill it and wedge the driver
+/// and worker against each other on reconnect. The next
+/// [`Connected`](WorkerMsg::Connected) republishes the full cache through
+/// [`on_connect`].
+///
+/// # Arguments
+///
+/// * `connected` - Whether the broker connection is currently up.
+/// * `client` - The publish seam.
+/// * `controls` - The device controls to read.
+/// * `topics` - The bridge's topic layout.
+/// * `cache` - The state cache to refresh.
+/// * `export_limit_max` - The export-limit `number`'s maximum, in watts.
+async fn poll_and_publish(
+    connected: bool,
+    client: &impl MqttPublisher,
+    controls: &impl EnphaseControls,
+    topics: &BridgeTopics,
+    cache: &mut StateCache,
+    export_limit_max: f64,
+) {
+    poll_once(controls, cache).await;
+    if connected {
+        publish_discovery(client, topics, cache.profile_options(), export_limit_max).await;
+        publish_all(client, cache.messages(topics)).await;
+    }
 }
 
 /// Convert a discovery message into a retained [`PublishMessage`].
@@ -421,9 +488,11 @@ fn into_publish(message: crate::discovery::DiscoveryMessage) -> PublishMessage {
 /// The device worker: own the controls and cache, service the channel and poll.
 ///
 /// Runs on the `LocalSet` thread. Reacts to connection events and commands from
-/// the driver, polls on the interval, and publishes the cache's view. On a
-/// shutdown signal it publishes availability `offline` once and returns, which
-/// ends `run_until` and drops the driver.
+/// the driver, polls on the interval, and publishes the cache's view while the
+/// broker is connected. On a shutdown signal it publishes availability `offline`
+/// once and returns `Ok`, which ends `run_until` and drops the driver. If the
+/// driver task ends first (its sender is dropped), the worker returns an error so
+/// a supervisor restarts the process rather than leaving it silently idle.
 ///
 /// # Arguments
 ///
@@ -432,19 +501,24 @@ fn into_publish(message: crate::discovery::DiscoveryMessage) -> PublishMessage {
 /// * `topics` - The bridge's topic layout.
 /// * `rx` - The channel from the MQTT driver.
 /// * `config` - The resilience knobs (poll interval, thresholds, cap).
+///
+/// # Errors
+///
+/// Returns an error if the MQTT driver task ends before a shutdown signal.
 #[expect(
     clippy::integer_division_remainder_used,
     clippy::cognitive_complexity,
     reason = "both live inside the tokio::select! macro expansion"
 )]
 async fn device_worker(
-    client: AsyncClient,
+    client: impl MqttPublisher,
     controls: impl EnphaseControls,
     topics: BridgeTopics,
     mut rx: mpsc::Receiver<WorkerMsg>,
     config: ResilienceConfig,
-) {
+) -> anyhow::Result<()> {
     let mut cache = StateCache::new(config.failure_threshold);
+    let mut connected = false;
     let mut interval = tokio::time::interval(Duration::from_secs(config.poll_interval));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -463,13 +537,17 @@ async fn device_worker(
                 // graceful DISCONNECT would suppress the LWT and must drain this
                 // publish itself first.
                 publish_availability(&client, &topics, "offline").await;
-                return;
+                return Ok(());
             }
             message = rx.recv() => {
                 match message {
                     Some(WorkerMsg::Connected) => {
+                        connected = true;
                         on_connect(&client, &controls, &topics, &mut cache, config.export_limit_max)
                             .await;
+                    }
+                    Some(WorkerMsg::Disconnected) => {
+                        connected = false;
                     }
                     Some(WorkerMsg::Command(command)) => {
                         if let Err(err) =
@@ -478,16 +556,27 @@ async fn device_worker(
                         {
                             warn!("command failed, reverting to last-known-good: {err:#}");
                         }
-                        publish_all(&client, cache.messages(&topics)).await;
+                        if connected {
+                            publish_all(&client, cache.messages(&topics)).await;
+                        }
                     }
-                    None => return,
+                    None => {
+                        return Err(anyhow::anyhow!(
+                            "MQTT driver task ended before shutdown; restarting"
+                        ));
+                    }
                 }
             }
             _ = interval.tick() => {
-                poll_once(&controls, &mut cache).await;
-                publish_discovery(&client, &topics, cache.profile_options(), config.export_limit_max)
-                    .await;
-                publish_all(&client, cache.messages(&topics)).await;
+                poll_and_publish(
+                    connected,
+                    &client,
+                    &controls,
+                    &topics,
+                    &mut cache,
+                    config.export_limit_max,
+                )
+                .await;
             }
         }
     }
@@ -497,8 +586,8 @@ async fn device_worker(
 ///
 /// Connects to MQTT and runs two cooperating tasks on a `LocalSet`: a driver that
 /// keeps the event loop polled, and a worker that owns the device controls and
-/// cache. On SIGINT/SIGTERM the worker publishes availability `offline` and
-/// returns; a crash is still covered by the Last Will.
+/// cache. On SIGINT/SIGTERM the worker returns and the broker's Last Will marks
+/// the bridge offline; a crash is covered by the same Last Will.
 ///
 /// # Arguments
 ///
@@ -506,9 +595,10 @@ async fn device_worker(
 ///
 /// # Errors
 ///
-/// Returns an error if a required Enphase identity argument is missing (before
-/// the loop starts). The run loop itself never propagates a transient error:
-/// broker, Envoy, and shutdown-publish failures are logged, not returned.
+/// Returns an error if a required Enphase identity argument is missing (before the
+/// loop starts), or if the MQTT driver task ends before shutdown. Transient
+/// broker and Envoy failures are logged and folded into availability, not
+/// returned.
 #[inline]
 pub async fn run(args: Args) -> anyhow::Result<()> {
     let topics = BridgeTopics::new(&args.topic_prefix);
@@ -537,11 +627,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 tx,
                 config.export_limit_max,
             ));
-            device_worker(client, controls, topics, rx, config).await;
+            device_worker(client, controls, topics, rx, config).await
         })
-        .await;
-
-    Ok(())
+        .await
 }
 
 #[cfg(test)]
@@ -559,6 +647,60 @@ mod tests {
             next_backoff(Duration::from_secs(40)),
             Duration::from_secs(60)
         );
+    }
+
+    use crate::controls::{ExportLimit, GridProfiles, MockEnphaseControls};
+
+    /// Mock controls that answer every read with a fixed, reachable value.
+    fn reachable_controls() -> MockEnphaseControls {
+        let mut controls = MockEnphaseControls::new();
+        controls.expect_panels_state().returning(|| Ok(true));
+        controls.expect_export_limit_state().returning(|| {
+            Ok(ExportLimit {
+                enabled: true,
+                limit_w: 0.0,
+            })
+        });
+        controls.expect_grid_profiles().returning(|| {
+            Ok(GridProfiles {
+                selected_id: "AUS_A:1.2".to_owned(),
+                available: vec!["AUS_A:1.2".to_owned()],
+            })
+        });
+        controls
+    }
+
+    #[tokio::test]
+    async fn poll_and_publish_stays_silent_while_disconnected() {
+        let controls = reachable_controls();
+        let mut publisher = MockMqttPublisher::new();
+        // The regression guard for the broker-outage deadlock: a disconnected tick
+        // must not enqueue a single publish, or the queue fills and wedges both
+        // tasks on reconnect.
+        publisher.expect_publish().never();
+        let topics = BridgeTopics::new("enphase");
+        let mut cache = StateCache::new(3);
+        poll_and_publish(false, &publisher, &controls, &topics, &mut cache, 5_000.0).await;
+        // The poll still refreshed the cache, ready for the next reconnect.
+        assert!(
+            cache
+                .messages(&topics)
+                .iter()
+                .any(|m| m.topic == topics.panels_state && m.payload == "ON")
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_and_publish_publishes_while_connected() {
+        let controls = reachable_controls();
+        let mut publisher = MockMqttPublisher::new();
+        publisher
+            .expect_publish()
+            .times(1..)
+            .returning(|_topic, _retain, _payload| Ok(()));
+        let topics = BridgeTopics::new("enphase");
+        let mut cache = StateCache::new(3);
+        poll_and_publish(true, &publisher, &controls, &topics, &mut cache, 5_000.0).await;
     }
 
     #[test]
