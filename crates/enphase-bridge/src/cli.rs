@@ -4,6 +4,34 @@ use std::path::PathBuf;
 
 use crate::version::Version;
 
+/// Parse and validate the export-limit cap: a finite, strictly positive wattage.
+///
+/// # Arguments
+///
+/// * `value` - The raw `--export-limit-max` argument.
+///
+/// # Returns
+///
+/// The parsed cap in watts.
+///
+/// # Errors
+///
+/// Returns a message if the value does not parse, is not finite (`nan`, `inf`),
+/// or is not strictly positive — any of which would silently reject every
+/// export-limit command or defeat the regulatory cap.
+fn parse_export_limit_max(value: &str) -> Result<f64, String> {
+    let watts: f64 = value
+        .parse()
+        .map_err(|_ignored| format!("`{value}` is not a number"))?;
+    if watts.is_finite() && watts > 0.0 {
+        Ok(watts)
+    } else {
+        Err(format!(
+            "export-limit cap must be a finite, positive wattage, got `{value}`"
+        ))
+    }
+}
+
 /// The `enphase-bridge` command-line arguments.
 ///
 /// With no subcommand the bridge runs; the Enphase identity arguments are then
@@ -89,7 +117,8 @@ pub struct Args {
     #[arg(
         long,
         env = "EXPORT_LIMIT_MAX",
-        default_value_t = crate::discovery::DEFAULT_EXPORT_LIMIT_MAX
+        default_value_t = crate::discovery::DEFAULT_EXPORT_LIMIT_MAX,
+        value_parser = parse_export_limit_max
     )]
     pub export_limit_max: f64,
 
@@ -172,6 +201,49 @@ mod tests {
         assert!((args.export_limit_max - 5_000.0_f64).abs() < f64::EPSILON);
         assert_eq!(args.command_retries, 2);
         assert_eq!(args.poll_failure_threshold, 3);
+    }
+
+    #[test]
+    fn export_limit_max_rejects_non_finite_and_non_positive() {
+        for bad in ["nan", "inf", "-1", "0"] {
+            let result = Args::try_parse_from([
+                "enphase-bridge",
+                "--username",
+                "user",
+                "--password",
+                "pass",
+                "--host",
+                "envoy.local",
+                "--site-name",
+                "Site",
+                "--serial-number",
+                "121212121212",
+                "--export-limit-max",
+                bad,
+            ]);
+            let _err = result.expect_err("non-finite or non-positive cap is rejected");
+        }
+    }
+
+    #[test]
+    fn export_limit_max_accepts_a_positive_cap() {
+        let args = Args::try_parse_from([
+            "enphase-bridge",
+            "--username",
+            "user",
+            "--password",
+            "pass",
+            "--host",
+            "envoy.local",
+            "--site-name",
+            "Site",
+            "--serial-number",
+            "121212121212",
+            "--export-limit-max",
+            "3000",
+        ])
+        .expect("args parse");
+        assert!((args.export_limit_max - 3_000.0_f64).abs() < f64::EPSILON);
     }
 
     #[test]
