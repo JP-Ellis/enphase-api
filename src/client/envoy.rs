@@ -16,8 +16,9 @@
 
 use alloc::sync::Arc;
 use core::fmt::Display;
+use std::path::PathBuf;
 
-use crate::client::auth::Credentials;
+use crate::client::auth::{Credentials, load_cached_token, save_cached_token};
 use crate::{
     client::{auth::AuthState, entrez::Entrez},
     error::Result,
@@ -83,6 +84,9 @@ pub struct Envoy {
     /// token itself; when `None` it behaves as a plain, externally
     /// authenticated client. Shared behind an `Arc` so clones share one token.
     auth: Option<Arc<AuthState>>,
+    /// Optional path for persisting the acquired token (mode `0600`). `None`
+    /// keeps the token in memory only. Only meaningful alongside `auth`.
+    token_cache: Option<PathBuf>,
 }
 
 impl Envoy {
@@ -127,6 +131,7 @@ impl Envoy {
             client,
             base_url,
             auth: None,
+            token_cache: None,
         }
     }
 
@@ -164,6 +169,7 @@ impl Envoy {
             client,
             base_url,
             auth: None,
+            token_cache: None,
         }
     }
 
@@ -225,7 +231,43 @@ impl Envoy {
             client,
             base_url,
             auth: Some(Arc::new(AuthState::new(entrez, credentials))),
+            token_cache: None,
         }
+    }
+
+    /// Persist the acquired token to a file (mode `0600`).
+    ///
+    /// By default a self-authenticating client holds its token in memory only,
+    /// so every process restart triggers a fresh cloud login. With a cache
+    /// path, the client reuses a previously stored token until it expires or is
+    /// rejected, and writes each freshly acquired token back — minimising
+    /// contact with Enphase. The file holds an installer-grade credential and is
+    /// created `0600`.
+    ///
+    /// Has no effect on a client built without [`with_auth`](Self::with_auth).
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The file the token is cached in.
+    ///
+    /// # Returns
+    ///
+    /// Returns the client with token caching enabled.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use enphase_api::{Credentials, Entrez, Envoy};
+    ///
+    /// let creds = Credentials::new("user@example.com", "password", "My Site", "121212121212");
+    /// let envoy = Envoy::with_auth("envoy.local", Entrez::default(), creds)
+    ///     .with_token_cache("/var/lib/enphase-bridge/token.jwt");
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn with_token_cache(mut self, path: impl Into<PathBuf>) -> Self {
+        self.token_cache = Some(path.into());
+        self
     }
 
     /// Ensure a token has been acquired, acquiring one if not.
@@ -239,19 +281,36 @@ impl Envoy {
         if auth.token().is_some() {
             return Ok(());
         }
+
+        // Try a cached token before a full login: if it still validates, reuse
+        // it and skip the cloud round-trip. A missing, unreadable, or stale
+        // cache falls through to a full login.
+        if let Some(path) = self.token_cache.as_ref()
+            && let Some(cached) = load_cached_token(path)
+            && self.authenticate(&cached).await.is_ok()
+        {
+            debug!("Reusing cached token");
+            auth.set_token(cached);
+            return Ok(());
+        }
+
         self.refresh().await
     }
 
     /// Force a fresh login and replace the held token.
     ///
     /// A no-op when no auth source is configured. Acquires a new JWT via Entrez,
-    /// validates it against the device, and stores it.
+    /// validates it against the device, stores it, and — when a cache path is
+    /// configured — writes it to the cache file (mode `0600`).
     async fn refresh(&self) -> Result<()> {
         let Some(auth) = self.auth.as_ref() else {
             return Ok(());
         };
         let token = auth.acquire_token().await?;
         self.authenticate(&token).await?;
+        if let Some(path) = self.token_cache.as_ref() {
+            save_cached_token(path, &token)?;
+        }
         auth.set_token(token);
         Ok(())
     }
@@ -981,6 +1040,7 @@ mod tests {
             client: test_client,
             base_url: mock_server.uri(),
             auth: None,
+            token_cache: None,
         }
     }
 
@@ -1524,6 +1584,7 @@ mod tests {
             client: test_http_client(),
             base_url: envoy_server.uri(),
             auth: Some(Arc::new(AuthState::new(entrez, credentials))),
+            token_cache: None,
         }
     }
 
@@ -1663,5 +1724,149 @@ mod tests {
         }
         // No Entrez server exists; a login attempt would fail the test.
         // envoy.expect(1) verifies no retry occurred.
+    }
+
+    /// Best-effort removal of a token-cache test file, ignoring any error.
+    fn remove_cache(path: &std::path::Path) {
+        match std::fs::remove_file(path) {
+            Ok(()) | Err(_) => {}
+        }
+    }
+
+    /// A unique path under the OS temp dir for a token-cache test.
+    fn unique_cache_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "enphase-token-cache-{tag}-{}-{nanos}.jwt",
+            std::process::id()
+        ))
+    }
+
+    /// Mount the Envoy JWT check and a 204 power endpoint for an auth flow.
+    async fn mount_envoy_auth_and_power(envoy_server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/auth/check_jwt"))
+            .respond_with(fixture_response("envoy", "authenticate-valid"))
+            .mount(envoy_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/ivp/mod/603980032/mode/power"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(envoy_server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn token_cache_written_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let entrez_server = MockServer::start().await;
+        let envoy_server = MockServer::start().await;
+        let cache_path = unique_cache_path("0600");
+
+        // No cache yet: one full login, which writes the cache.
+        mount_entrez(&entrez_server, 1).await;
+        mount_envoy_auth_and_power(&envoy_server).await;
+
+        let envoy = test_envoy_with_auth(
+            &envoy_server,
+            test_entrez(&entrez_server),
+            test_credentials(),
+        )
+        .with_token_cache(&cache_path);
+
+        let result = envoy.set_power_state("603980032", PowerState::On).await;
+        assert!(
+            result.is_ok(),
+            "auth flow should succeed. Error: {:?}",
+            result.err()
+        );
+
+        let metadata = std::fs::metadata(&cache_path).expect("cache file should exist");
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "cache file must be created mode 0600, got {mode:o}"
+        );
+
+        remove_cache(&cache_path);
+    }
+
+    #[tokio::test]
+    async fn cached_token_skips_login() {
+        let entrez_server = MockServer::start().await;
+        let envoy_server = MockServer::start().await;
+        let cache_path = unique_cache_path("skips");
+
+        // A valid cached token: Entrez must never be contacted.
+        std::fs::write(&cache_path, "SANITIZED_JWT_TOKEN").expect("write cache");
+        mount_entrez(&entrez_server, 0).await;
+        mount_envoy_auth_and_power(&envoy_server).await;
+
+        let envoy = test_envoy_with_auth(
+            &envoy_server,
+            test_entrez(&entrez_server),
+            test_credentials(),
+        )
+        .with_token_cache(&cache_path);
+
+        let result = envoy.set_power_state("603980032", PowerState::On).await;
+        assert!(
+            result.is_ok(),
+            "a valid cached token should authenticate without login. Error: {:?}",
+            result.err()
+        );
+
+        remove_cache(&cache_path);
+        // entrez.expect(0) is verified on server drop: no login/token hit.
+    }
+
+    #[tokio::test]
+    async fn stale_cache_falls_back_to_login() {
+        let entrez_server = MockServer::start().await;
+        let envoy_server = MockServer::start().await;
+        let cache_path = unique_cache_path("stale");
+
+        // A stale cached token the device rejects: fall back to a full login.
+        std::fs::write(&cache_path, "stale-junk").expect("write cache");
+        mount_entrez(&entrez_server, 1).await;
+
+        // The stale token is rejected; the freshly minted token is accepted.
+        Mock::given(method("GET"))
+            .and(path("/auth/check_jwt"))
+            .and(header("Authorization", "Bearer stale-junk"))
+            .respond_with(fixture_response("envoy", "authenticate-invalid"))
+            .mount(&envoy_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/auth/check_jwt"))
+            .respond_with(fixture_response("envoy", "authenticate-valid"))
+            .mount(&envoy_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/ivp/mod/603980032/mode/power"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&envoy_server)
+            .await;
+
+        let envoy = test_envoy_with_auth(
+            &envoy_server,
+            test_entrez(&entrez_server),
+            test_credentials(),
+        )
+        .with_token_cache(&cache_path);
+
+        let result = envoy.set_power_state("603980032", PowerState::On).await;
+        assert!(
+            result.is_ok(),
+            "a stale cache should fall back to a full login. Error: {:?}",
+            result.err()
+        );
+
+        remove_cache(&cache_path);
+        // entrez.expect(1) verifies the fallback login happened.
     }
 }
