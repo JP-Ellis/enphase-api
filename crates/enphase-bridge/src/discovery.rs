@@ -54,7 +54,8 @@ fn device_block() -> serde_json::Value {
 ///
 /// # Returns
 ///
-/// A `(availability, availability_mode)` JSON pair to splice into a payload.
+/// The JSON availability array (bridge topic then entity topic) for the payload's
+/// `availability` field; the caller sets `availability_mode` separately.
 fn layered_availability(bridge: &str, entity: &str) -> serde_json::Value {
     json!([{ "topic": bridge }, { "topic": entity }])
 }
@@ -201,25 +202,38 @@ mod tests {
     fn control_entities_list_two_availability_topics_all_mode() {
         let topics = BridgeTopics::new("enphase");
         let msgs = discovery_configs(&topics, "bridge", &[], 5000.0);
-        let panels: serde_json::Value =
-            serde_json::from_str(&msgs.first().expect("panels message").payload).expect("json");
-        assert_eq!(
-            panels
-                .pointer("/availability_mode")
-                .and_then(serde_json::Value::as_str),
-            Some("all")
-        );
-        let topics_listed: Vec<&str> = panels
-            .pointer("/availability")
-            .and_then(serde_json::Value::as_array)
-            .expect("availability array")
-            .iter()
-            .filter_map(|a| a.pointer("/topic").and_then(|t| t.as_str()))
-            .collect();
-        assert_eq!(
-            topics_listed,
-            vec!["enphase/availability", "enphase/panels/availability"]
-        );
+        // Each control entity (index 0..3) layers the bridge LWT with its own
+        // per-entity availability topic under `availability_mode: all`; a
+        // wrongly wired export-limit or grid-profile entity must not slip through.
+        let expected = [
+            (0, "enphase/panels/availability"),
+            (1, "enphase/export_limit/availability"),
+            (2, "enphase/grid_profile/availability"),
+        ];
+        for (index, entity_topic) in expected {
+            let entity: serde_json::Value =
+                serde_json::from_str(&msgs.get(index).expect("control message").payload)
+                    .expect("json");
+            assert_eq!(
+                entity
+                    .pointer("/availability_mode")
+                    .and_then(serde_json::Value::as_str),
+                Some("all"),
+                "entity at index {index} must use availability_mode all"
+            );
+            let topics_listed: Vec<&str> = entity
+                .pointer("/availability")
+                .and_then(serde_json::Value::as_array)
+                .expect("availability array")
+                .iter()
+                .filter_map(|a| a.pointer("/topic").and_then(|t| t.as_str()))
+                .collect();
+            assert_eq!(
+                topics_listed,
+                vec!["enphase/availability", entity_topic],
+                "entity at index {index} must layer the bridge LWT with its own topic"
+            );
+        }
     }
 
     #[test]
