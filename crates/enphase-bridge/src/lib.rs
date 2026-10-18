@@ -11,6 +11,7 @@
 
 #![expect(clippy::pub_use, reason = "Root API re-exports for convenience")]
 
+mod cache;
 mod controls;
 mod discovery;
 mod dispatch;
@@ -24,6 +25,7 @@ pub mod cli;
 pub mod logging;
 pub mod version;
 
+pub use cache::{Entity, PublishMessage, StateCache};
 pub use controls::{EnphaseControls, EnvoyControls, ExportLimit, GridProfiles, quorum_on};
 pub use discovery::{DiscoveryMessage, discovery_configs, zero_export_discovery_clear};
 pub use dispatch::handle_command;
