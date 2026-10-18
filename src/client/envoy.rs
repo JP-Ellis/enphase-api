@@ -28,7 +28,7 @@ use crate::{
     },
 };
 use serde::Serialize;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 /// Request body for `POST /ivp/ss/dpel`.
 ///
@@ -244,6 +244,10 @@ impl Envoy {
     /// contact with Enphase. The file holds an installer-grade credential and is
     /// created `0600`.
     ///
+    /// Caching is best-effort: if the token cannot be read or written (missing
+    /// parent directory, read-only filesystem), the client logs a warning and
+    /// carries on in memory rather than failing.
+    ///
     /// Has no effect on a client built without [`with_auth`](Self::with_auth).
     ///
     /// # Arguments
@@ -308,8 +312,14 @@ impl Envoy {
         };
         let token = auth.acquire_token().await?;
         self.authenticate(&token).await?;
-        if let Some(path) = self.token_cache.as_ref() {
-            save_cached_token(path, &token)?;
+        // Persisting the token is best-effort: a write failure (missing parent
+        // directory, read-only filesystem, full disk) must not fail an
+        // authentication that otherwise succeeded, which would brick the client.
+        // The error message carries no token value, so logging it is safe.
+        if let Some(path) = self.token_cache.as_ref()
+            && let Err(err) = save_cached_token(path, &token)
+        {
+            warn!(%err, "Failed to persist token cache; continuing in-memory");
         }
         auth.set_token(token);
         Ok(())
@@ -1868,5 +1878,72 @@ mod tests {
 
         remove_cache(&cache_path);
         // entrez.expect(1) verifies the fallback login happened.
+    }
+
+    #[tokio::test]
+    async fn cache_write_failure_does_not_fail_auth() {
+        let entrez_server = MockServer::start().await;
+        let envoy_server = MockServer::start().await;
+
+        // A cache path whose parent directory does not exist: the write fails,
+        // but authentication itself succeeded, so the call must still succeed —
+        // a bad cache path must not brick an otherwise-working client.
+        let cache_path = unique_cache_path("badpath")
+            .join("does-not-exist")
+            .join("token.jwt");
+
+        mount_entrez(&entrez_server, 1).await;
+        mount_envoy_auth_and_power(&envoy_server).await;
+
+        let envoy = test_envoy_with_auth(
+            &envoy_server,
+            test_entrez(&entrez_server),
+            test_credentials(),
+        )
+        .with_token_cache(&cache_path);
+
+        let result = envoy.set_power_state("603980032", PowerState::On).await;
+        assert!(
+            result.is_ok(),
+            "a cache write failure must not fail authentication. Error: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn credentials_debug_redacts_password() {
+        let creds = Credentials::new(
+            "user@example.com",
+            "hunter2-secret-password",
+            "My Site",
+            "121212121212",
+        );
+        let rendered = format!("{creds:?}");
+        assert!(
+            !rendered.contains("hunter2-secret-password"),
+            "Debug must not expose the password: {rendered}"
+        );
+    }
+
+    #[test]
+    fn auth_state_debug_redacts_token() {
+        let creds = Credentials::new(
+            "user@example.com",
+            "hunter2-secret-password",
+            "My Site",
+            "121212121212",
+        );
+        let state = AuthState::new(Entrez::default(), creds);
+        state.set_token("super-secret-jwt-value".to_owned());
+
+        let rendered = format!("{state:?}");
+        assert!(
+            !rendered.contains("super-secret-jwt-value"),
+            "Debug must not expose the token: {rendered}"
+        );
+        assert!(
+            !rendered.contains("hunter2-secret-password"),
+            "Debug must not expose the password via credentials: {rendered}"
+        );
     }
 }

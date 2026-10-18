@@ -67,7 +67,7 @@ pub(crate) fn save_cached_token(path: &Path, token: &str) -> Result<()> {
 /// Combines the Enphase account login with the site and serial the token is
 /// minted for. Fields are private; construct with [`Credentials::new`] and
 /// adjust the commissioned flag with [`Credentials::commissioned`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct Credentials {
     /// Enphase account username.
@@ -80,6 +80,20 @@ pub struct Credentials {
     serial_number: String,
     /// Whether the device is commissioned.
     commissioned: bool,
+}
+
+impl core::fmt::Debug for Credentials {
+    /// Redacts the password so it never reaches logs via a debug print.
+    #[inline]
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("site_name", &self.site_name)
+            .field("serial_number", &self.serial_number)
+            .field("commissioned", &self.commissioned)
+            .finish()
+    }
 }
 
 impl Credentials {
@@ -153,7 +167,6 @@ impl Credentials {
 /// Holds the Entrez client and credentials used to mint a JWT, plus the token
 /// most recently obtained. Shared behind an `Arc` so cloning an `Envoy` shares
 /// one token.
-#[derive(Debug)]
 pub(crate) struct AuthState {
     /// The Entrez client used to log in and generate tokens.
     entrez: Entrez,
@@ -161,6 +174,19 @@ pub(crate) struct AuthState {
     credentials: Credentials,
     /// The most recently acquired token, if any.
     token: Mutex<Option<String>>,
+}
+
+impl core::fmt::Debug for AuthState {
+    /// Reports only whether a token is held, never its value.
+    #[inline]
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let token_present = self.token.lock().is_ok_and(|guard| guard.is_some());
+        f.debug_struct("AuthState")
+            .field("entrez", &self.entrez)
+            .field("credentials", &self.credentials)
+            .field("token_present", &token_present)
+            .finish()
+    }
 }
 
 impl AuthState {
