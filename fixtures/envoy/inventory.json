@@ -1,0 +1,5 @@
+{
+  "name": "inventory",
+  "status_code": 200,
+  "body": "[{\"type\":\"PCU\",\"devices\":[{\"serial_num\":\"482412345678\"},{\"serial_num\":\"482412345679\"}]},{\"type\":\"NSRB\",\"devices\":[{\"serial_num\":\"123456789012\"}]}]"
+}
