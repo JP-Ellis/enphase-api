@@ -42,12 +42,12 @@ async fn envoy_controls_end_to_end() {
 
 /// A refused connection classifies as [`Reachability::Unreachable`].
 ///
-/// Points an [`Envoy`] at a port nothing listens on and confirms the resulting
-/// error is read as a connection-level failure. The connect branch cannot be
-/// unit-tested because `reqwest::Error` has no public constructor, so it is
-/// exercised here against a real (refused) socket.
+/// Points an [`Envoy`] at a loopback port nothing listens on and confirms the
+/// resulting error is read as a connection-level failure. The connect branch
+/// cannot be unit-tested because `reqwest::Error` has no public constructor, so it
+/// is exercised here against a refused `127.0.0.1:1` socket — deterministic and
+/// network-free, so it runs in CI.
 #[tokio::test]
-#[ignore = "hits an unreachable host"]
 async fn classify_connection_error_is_unreachable() {
     let envoy = Envoy::new("127.0.0.1:1");
     let err = envoy
@@ -59,11 +59,12 @@ async fn classify_connection_error_is_unreachable() {
 
 /// An unreachable Envoy drives the whole cache offline through `poll_once`.
 ///
-/// Points the real controls at a refused socket and confirms `poll_once` marks
-/// reachability off. This exercises the connection-level branch end to end,
-/// which cannot be unit-tested because `reqwest::Error` has no public constructor.
+/// Points the real controls at a refused loopback socket and confirms `poll_once`
+/// marks reachability off. This exercises the connection-level branch end to end,
+/// which cannot be unit-tested because `reqwest::Error` has no public constructor;
+/// the refused `127.0.0.1:1` socket is deterministic and network-free, so it runs
+/// in CI.
 #[tokio::test]
-#[ignore = "hits an unreachable host"]
 async fn poll_once_unreachable_drops_everything() {
     let controls = EnvoyControls::new(Envoy::new("127.0.0.1:1"));
     let mut cache = StateCache::new(1);
