@@ -1,16 +1,13 @@
-//! Enphase ↔ MQTT bridge.
+//! Enphase ↔ MQTT bridge binary.
 //!
-//! A thin, long-running process that exposes the Enphase gateway's controls as
-//! Home Assistant entities over MQTT discovery. It holds no pricing or decision
-//! logic: Home Assistant owns those and drives the bridge through MQTT command
-//! topics.
+//! A thin shim over the [`enphase_bridge`] library: it parses arguments, sets
+//! up logging, and (in a later task) runs the bridge or prints the version.
 
 use std::process::ExitCode;
 
 use clap::Parser as _;
 
-mod logging;
-mod version;
+use enphase_bridge::{logging, version};
 
 /// Command-line arguments.
 ///
