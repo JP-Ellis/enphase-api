@@ -417,6 +417,7 @@ dependencies = [
  "enphase-api",
  "mockall",
  "pretty_assertions",
+ "reqwest",
  "rumqttc",
  "serde",
  "serde_json",
