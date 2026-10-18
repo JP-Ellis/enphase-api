@@ -1,34 +1,41 @@
 //! Enphase ↔ MQTT bridge binary.
 //!
 //! A thin shim over the [`enphase_bridge`] library: it parses arguments, sets
-//! up logging, and (in a later task) runs the bridge or prints the version.
+//! up logging, and either runs the bridge or prints the version.
 
 use std::process::ExitCode;
 
 use clap::Parser as _;
+use tracing::error;
 
-use enphase_bridge::{logging, version};
-
-/// Command-line arguments.
-///
-/// This is a minimal skeleton fleshed out in a later task with the full bridge
-/// configuration and the `version` subcommand.
-#[derive(clap::Parser, Debug)]
-#[command(name = "enphase-bridge")]
-#[command(about = "Enphase ↔ MQTT bridge for Home Assistant")]
-#[command(version = version::Version::default())]
-struct Args {
-    /// Increase verbosity level: `-v` info, `-vv` debug with timing.
-    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
-    verbosity: u8,
-}
+use enphase_bridge::cli::{Args, Command};
+use enphase_bridge::{bridge, logging, version};
 
 /// Entry point.
 ///
-/// Parses arguments, initialises logging, and returns a process exit code.
+/// Parses arguments, initialises logging, and dispatches to the bridge run loop
+/// or the `version` subcommand.
 #[tokio::main]
+#[expect(
+    clippy::print_stdout,
+    reason = "the version subcommand prints version information to stdout"
+)]
 async fn main() -> ExitCode {
     let args = Args::parse();
     logging::setup_tracing(args.verbosity);
-    ExitCode::SUCCESS
+
+    let result = if matches!(args.command, Some(Command::Version)) {
+        println!("{}", version::Version::default());
+        Ok(())
+    } else {
+        bridge::run(args).await
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            error!("{err:#}");
+            ExitCode::FAILURE
+        }
+    }
 }

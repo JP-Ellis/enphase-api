@@ -18,6 +18,8 @@ mod payload;
 mod state;
 mod topics;
 
+pub mod bridge;
+pub mod cli;
 pub mod logging;
 pub mod version;
 

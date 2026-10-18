@@ -1,0 +1,14 @@
+[Unit]
+Description=Enphase MQTT bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ProtectSystem=full
+EnvironmentFile=/etc/conf.d/enphase-bridge
+
+ExecStart=/usr/local/bin/enphase-bridge -v
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
