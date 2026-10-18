@@ -6,7 +6,9 @@
 #![cfg(test)]
 
 use enphase_api::{Credentials, Entrez, Envoy};
-use enphase_bridge::{EnphaseControls as _, EnvoyControls};
+use enphase_bridge::{EnphaseControls as _, EnvoyControls, Reachability, classify};
+
+use pretty_assertions::assert_eq;
 
 /// Exercise the real [`EnvoyControls`] against a live device.
 ///
@@ -33,4 +35,21 @@ async fn envoy_controls_end_to_end() {
     let profiles = controls.grid_profiles().await.expect("read grid profiles");
 
     println!("panels_on={panels} export_limit={export_limit:?} profiles={profiles:?}");
+}
+
+/// A refused connection classifies as [`Reachability::Unreachable`].
+///
+/// Points an [`Envoy`] at a port nothing listens on and confirms the resulting
+/// error is read as a connection-level failure. The connect branch cannot be
+/// unit-tested because `reqwest::Error` has no public constructor, so it is
+/// exercised here against a real (refused) socket.
+#[tokio::test]
+#[ignore = "hits an unreachable host"]
+async fn classify_connection_error_is_unreachable() {
+    let envoy = Envoy::new("127.0.0.1:1");
+    let err = envoy
+        .get_inverters()
+        .await
+        .expect_err("connection to 127.0.0.1:1 is refused");
+    assert_eq!(classify(&err.into()), Reachability::Unreachable);
 }
