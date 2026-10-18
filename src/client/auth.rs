@@ -5,10 +5,62 @@
 //! refresh it transparently when a request is rejected with
 //! [`Unauthorized`](crate::error::EnphaseError::Unauthorized).
 
+use std::path::Path;
 use std::sync::Mutex;
 
 use crate::client::entrez::Entrez;
 use crate::error::Result;
+
+/// Read a cached token from `path`, best-effort.
+///
+/// A missing or unreadable file, or an empty/whitespace-only body, yields
+/// `None` — the caller then falls back to a full login. Read errors are never
+/// surfaced: a broken cache must not break authentication.
+///
+/// # Arguments
+///
+/// * `path` - The cache file to read.
+///
+/// # Returns
+///
+/// Returns the trimmed cached token, or `None` if none is available.
+pub(crate) fn load_cached_token(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|contents| contents.trim().to_owned())
+        .filter(|token| !token.is_empty())
+}
+
+/// Write `token` to `path`, creating the file with mode `0600`.
+///
+/// The token is an installer-grade credential, so the file is never
+/// world-readable: it is created `0600` and its permissions are reasserted
+/// after writing to cover the overwrite-an-existing-file case.
+///
+/// # Arguments
+///
+/// * `path` - The cache file to write.
+/// * `token` - The token to persist.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be created or written.
+pub(crate) fn save_cached_token(path: &Path, token: &str) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(token.as_bytes())?;
+    // `mode` above only applies when the file is created; reassert 0600 so an
+    // overwrite of a pre-existing file is tightened too.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
 
 /// Credentials for acquiring an Envoy JWT via the Enphase Entrez service.
 ///
