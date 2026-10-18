@@ -5,20 +5,12 @@
 
 use crate::topics::BridgeTopics;
 
-/// The maximum export limit, in watts, accepted on the command topic.
-///
-/// Mirrors the `max` the `number` discovery config advertises; keep the two in
-/// step.
-const MAX_EXPORT_LIMIT_W: f64 = 20_000.0;
-
 /// A command received from Home Assistant over an MQTT command topic.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Command {
     /// Turn the whole panel array on (`true`) or off (`false`).
     SetPanels(bool),
-    /// Enable (`true`) or disable (`false`) zero-export.
-    SetZeroExport(bool),
     /// Set the export limit, in watts.
     SetExportLimit(f64),
     /// Select the grid profile with the given id.
@@ -69,6 +61,8 @@ fn parse_switch(payload: &[u8]) -> Option<bool> {
 /// * `topic` - The topic the message arrived on.
 /// * `payload` - The raw MQTT payload bytes.
 /// * `topics` - The bridge's topic layout.
+/// * `export_limit_max` - The maximum export limit, in watts, to accept; mirrors
+///   the `max` the `number` discovery config advertises.
 ///
 /// # Returns
 ///
@@ -76,18 +70,21 @@ fn parse_switch(payload: &[u8]) -> Option<bool> {
 /// payload.
 #[inline]
 #[must_use]
-pub fn parse_command(topic: &str, payload: &[u8], topics: &BridgeTopics) -> Option<Command> {
+pub fn parse_command(
+    topic: &str,
+    payload: &[u8],
+    topics: &BridgeTopics,
+    export_limit_max: f64,
+) -> Option<Command> {
     if topic == topics.panels_command {
         parse_switch(payload).map(Command::SetPanels)
-    } else if topic == topics.zero_export_command {
-        parse_switch(payload).map(Command::SetZeroExport)
     } else if topic == topics.export_limit_command {
         let text = core::str::from_utf8(payload).ok()?.trim();
         let watts = text.parse::<f64>().ok()?;
         // Reject non-finite, negative, and out-of-range values (the range check
         // also excludes NaN and infinities), matching the bounds discovery
         // advertises, so a stray publisher cannot push a nonsense DPEL limit.
-        (0.0..=MAX_EXPORT_LIMIT_W)
+        (0.0..=export_limit_max)
             .contains(&watts)
             .then_some(Command::SetExportLimit(watts))
     } else if topic == topics.grid_profile_command {
@@ -165,15 +162,18 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    /// A cap comfortably above every value these tests parse.
+    const TEST_CAP: f64 = 20_000.0;
+
     #[test]
     fn parse_panels_on() {
         let topics = BridgeTopics::new("enphase");
         assert_eq!(
-            parse_command(&topics.panels_command, b"ON", &topics),
+            parse_command(&topics.panels_command, b"ON", &topics, TEST_CAP),
             Some(Command::SetPanels(true))
         );
         assert_eq!(
-            parse_command(&topics.panels_command, b"off", &topics),
+            parse_command(&topics.panels_command, b"off", &topics, TEST_CAP),
             Some(Command::SetPanels(false))
         );
     }
@@ -182,7 +182,7 @@ mod tests {
     fn parse_export_limit_number() {
         let topics = BridgeTopics::new("enphase");
         assert_eq!(
-            parse_command(&topics.export_limit_command, b"5000", &topics),
+            parse_command(&topics.export_limit_command, b"5000", &topics, TEST_CAP),
             Some(Command::SetExportLimit(5000.0))
         );
     }
@@ -191,7 +191,12 @@ mod tests {
     fn parse_select() {
         let topics = BridgeTopics::new("enphase");
         assert_eq!(
-            parse_command(&topics.grid_profile_command, b"AUS_A:1.2", &topics),
+            parse_command(
+                &topics.grid_profile_command,
+                b"AUS_A:1.2",
+                &topics,
+                TEST_CAP
+            ),
             Some(Command::SelectGridProfile("AUS_A:1.2".to_owned()))
         );
     }
@@ -199,14 +204,22 @@ mod tests {
     #[test]
     fn parse_unknown_topic_is_none() {
         let topics = BridgeTopics::new("enphase");
-        assert_eq!(parse_command("enphase/nope", b"ON", &topics), None);
+        assert_eq!(
+            parse_command("enphase/nope", b"ON", &topics, TEST_CAP),
+            None
+        );
     }
 
     #[test]
     fn parse_bad_number_is_none() {
         let topics = BridgeTopics::new("enphase");
         assert_eq!(
-            parse_command(&topics.export_limit_command, b"not-a-number", &topics),
+            parse_command(
+                &topics.export_limit_command,
+                b"not-a-number",
+                &topics,
+                TEST_CAP
+            ),
             None
         );
     }
@@ -221,19 +234,33 @@ mod tests {
             b"inf".as_slice(),
         ] {
             assert_eq!(
-                parse_command(&topics.export_limit_command, payload, &topics),
+                parse_command(&topics.export_limit_command, payload, &topics, TEST_CAP),
                 None,
                 "payload {payload:?} should be rejected"
             );
         }
         // The boundary values are accepted.
         assert_eq!(
-            parse_command(&topics.export_limit_command, b"0", &topics),
+            parse_command(&topics.export_limit_command, b"0", &topics, TEST_CAP),
             Some(Command::SetExportLimit(0.0))
         );
         assert_eq!(
-            parse_command(&topics.export_limit_command, b"20000", &topics),
+            parse_command(&topics.export_limit_command, b"20000", &topics, TEST_CAP),
             Some(Command::SetExportLimit(20000.0))
+        );
+    }
+
+    #[test]
+    fn parse_export_limit_rejects_above_cap() {
+        let topics = BridgeTopics::new("enphase");
+        // With a 5000 W cap, a 6000 W request is refused but the cap itself is accepted.
+        assert_eq!(
+            parse_command(&topics.export_limit_command, b"6000", &topics, 5_000.0),
+            None
+        );
+        assert_eq!(
+            parse_command(&topics.export_limit_command, b"5000", &topics, 5_000.0),
+            Some(Command::SetExportLimit(5000.0))
         );
     }
 
@@ -241,11 +268,16 @@ mod tests {
     fn parse_select_trims_and_rejects_empty() {
         let topics = BridgeTopics::new("enphase");
         assert_eq!(
-            parse_command(&topics.grid_profile_command, b"  AUS_A:1.2  ", &topics),
+            parse_command(
+                &topics.grid_profile_command,
+                b"  AUS_A:1.2  ",
+                &topics,
+                TEST_CAP
+            ),
             Some(Command::SelectGridProfile("AUS_A:1.2".to_owned()))
         );
         assert_eq!(
-            parse_command(&topics.grid_profile_command, b"   ", &topics),
+            parse_command(&topics.grid_profile_command, b"   ", &topics, TEST_CAP),
             None
         );
     }

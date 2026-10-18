@@ -290,8 +290,12 @@ async fn handle_poll_event(
             }
         }
         Ok(Event::Incoming(Packet::Publish(publish))) => {
-            if let Some(command) = parse_command(&publish.topic, &publish.payload, topics)
-                && let Err(err) = handle_command(command, controls).await
+            if let Some(command) = parse_command(
+                &publish.topic,
+                &publish.payload,
+                topics,
+                crate::discovery::DEFAULT_EXPORT_LIMIT_MAX,
+            ) && let Err(err) = handle_command(command, controls).await
             {
                 warn!("command on {} failed: {err:#}", publish.topic);
             }
