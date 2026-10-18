@@ -8,8 +8,8 @@ use crate::payload::Command;
 
 /// Dispatch a command to the device controls.
 ///
-/// Zero-export maps onto the export limit: turning it on sets a 0 W limit,
-/// turning it off disables DPEL entirely.
+/// The export-limit number drives DPEL directly: a 0 W limit is zero export, a
+/// non-zero value caps export at that figure.
 ///
 /// # Arguments
 ///
@@ -23,8 +23,6 @@ use crate::payload::Command;
 pub async fn handle_command(cmd: Command, controls: &impl EnphaseControls) -> anyhow::Result<()> {
     match cmd {
         Command::SetPanels(on) => controls.set_panels(on).await,
-        Command::SetZeroExport(true) => controls.set_export_limit(0.0).await,
-        Command::SetZeroExport(false) => controls.disable_export_limit().await,
         Command::SetExportLimit(watts) => controls.set_export_limit(watts).await,
         Command::SelectGridProfile(id) => controls.select_grid_profile(&id).await,
     }
@@ -50,24 +48,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_zero_export_on_sets_zero() {
+    async fn dispatch_set_export_limit() {
         let mut mock = MockEnphaseControls::new();
         mock.expect_set_export_limit()
-            .withf(|watts| *watts == 0.0_f64)
+            .withf(|watts| (*watts - 5000.0_f64).abs() < f64::EPSILON)
             .times(1)
             .returning(|_| Ok(()));
-        handle_command(Command::SetZeroExport(true), &mock)
-            .await
-            .expect("dispatch succeeds");
-    }
-
-    #[tokio::test]
-    async fn dispatch_zero_export_off_disables() {
-        let mut mock = MockEnphaseControls::new();
-        mock.expect_disable_export_limit()
-            .times(1)
-            .returning(|| Ok(()));
-        handle_command(Command::SetZeroExport(false), &mock)
+        handle_command(Command::SetExportLimit(5000.0), &mock)
             .await
             .expect("dispatch succeeds");
     }
