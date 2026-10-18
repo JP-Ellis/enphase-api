@@ -4,7 +4,7 @@
 //! Enphase Entrez service and an Envoy device. They are skipped if the required
 //! environment variables are not set.
 
-use enphase_api::{Entrez, Envoy, models::PowerState};
+use enphase_api::{Credentials, Entrez, Envoy, models::PowerState};
 
 /// Check if credentials are available for testing.
 fn has_credentials() -> Result<(), Box<dyn core::error::Error>> {
@@ -145,6 +145,33 @@ async fn authenticate_and_get_grid_profiles() -> Result<(), Box<dyn core::error:
     let index = envoy.get_grid_profiles().await?;
     println!("Active profile: {}", index.selected_profile_id);
     println!("Available profiles: {}", index.profiles.len());
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "Requires local Envoy device and Enphase credentials"]
+async fn self_authenticating_envoy() -> Result<(), Box<dyn core::error::Error>> {
+    has_credentials()?;
+
+    let username = std::env::var("ENTREZ_USERNAME")?;
+    let password = std::env::var("ENTREZ_PASSWORD")?;
+    let envoy_host = std::env::var("ENVOY_HOST")?;
+    let envoy_name = std::env::var("ENVOY_NAME")?;
+    let envoy_serial = std::env::var("ENVOY_SERIAL_NUMBER")?;
+
+    // Build a self-authenticating Envoy: no explicit login/token/authenticate
+    // dance — the client acquires and refreshes its token on demand.
+    let credentials = Credentials::new(username, password, envoy_name, envoy_serial);
+    let envoy = Envoy::with_auth(&envoy_host, Entrez::default(), credentials);
+
+    // The first call triggers the login → token → authenticate flow.
+    let is_on = envoy.get_power_state("603980032").await?;
+    println!("Power is {}", if is_on { "on" } else { "off" });
+
+    // A subsequent call reuses the held token (or refreshes on 401).
+    let settings = envoy.get_dpel().await?;
+    println!("Read back DPEL settings: {settings:?}");
 
     Ok(())
 }

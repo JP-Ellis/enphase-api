@@ -14,9 +14,12 @@
 //! Envoy devices typically use self-signed certificates. This client is configured to
 //! accept invalid certificates by default.
 
+use alloc::sync::Arc;
 use core::fmt::Display;
 
+use crate::client::auth::Credentials;
 use crate::{
+    client::{auth::AuthState, entrez::Entrez},
     error::Result,
     models::{
         AgfIndexResponse, DpelResponse, DpelSettings, InventorySection, PowerState,
@@ -76,6 +79,10 @@ pub struct Envoy {
     client: reqwest::Client,
     /// Base URL for the Envoy gateway.
     base_url: String,
+    /// Optional auth source. When present, the client acquires and refreshes a
+    /// token itself; when `None` it behaves as a plain, externally
+    /// authenticated client. Shared behind an `Arc` so clones share one token.
+    auth: Option<Arc<AuthState>>,
 }
 
 impl Envoy {
@@ -116,7 +123,11 @@ impl Envoy {
             .build()
             .expect("Failed to build HTTP client");
 
-        Self { client, base_url }
+        Self {
+            client,
+            base_url,
+            auth: None,
+        }
     }
 
     /// Create a new Envoy client with the given host and HTTP client.
@@ -149,7 +160,123 @@ impl Envoy {
     pub fn with_client(host: impl Display, client: reqwest::Client) -> Self {
         let base_url = format!("https://{host}");
 
-        Self { client, base_url }
+        Self {
+            client,
+            base_url,
+            auth: None,
+        }
+    }
+
+    /// Create a self-authenticating Envoy client.
+    ///
+    /// Unlike [`new`](Self::new), the returned client owns its token lifecycle:
+    /// on first use it logs in to Entrez, generates a JWT, and validates it
+    /// against the device; when a request is rejected with
+    /// [`Unauthorized`](crate::error::EnphaseError::Unauthorized) it refreshes
+    /// the token and retries once. Callers invoke the control and read methods
+    /// directly — no explicit [`authenticate`](Self::authenticate) call.
+    ///
+    /// The token is held in memory. To persist it across restarts, add
+    /// [`with_token_cache`](Self::with_token_cache).
+    ///
+    /// # Arguments
+    ///
+    /// * `host` - The hostname or IP address of the Envoy device.
+    /// * `entrez` - The Entrez client used to acquire tokens.
+    /// * `credentials` - The credentials used to acquire tokens.
+    ///
+    /// # Returns
+    ///
+    /// Returns a new self-authenticating [`Envoy`] client.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use enphase_api::{Credentials, Entrez, Envoy};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let creds = Credentials::new("user@example.com", "password", "My Site", "121212121212");
+    /// let envoy = Envoy::with_auth("envoy.local", Entrez::default(), creds);
+    /// // No explicit authenticate; the client logs in on first use.
+    /// let is_on = envoy.get_power_state("603980032").await?;
+    /// # let _ = is_on;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    #[expect(
+        clippy::missing_panics_doc,
+        clippy::expect_used,
+        reason = "reqwest::Client::builder() with basic config cannot fail"
+    )]
+    pub fn with_auth(host: impl Display, entrez: Entrez, credentials: Credentials) -> Self {
+        let base_url = format!("https://{host}");
+
+        let client = reqwest::Client::builder()
+            .user_agent(format!("enphase-api/{}", env!("CARGO_PKG_VERSION")))
+            .cookie_store(true)
+            .timeout(core::time::Duration::from_secs(30))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .expect("Failed to build HTTP client");
+
+        Self {
+            client,
+            base_url,
+            auth: Some(Arc::new(AuthState::new(entrez, credentials))),
+        }
+    }
+
+    /// Ensure a token has been acquired, acquiring one if not.
+    ///
+    /// A no-op when no auth source is configured or a token is already held.
+    /// Otherwise performs a full login → token → authenticate.
+    async fn ensure_authenticated(&self) -> Result<()> {
+        let Some(auth) = self.auth.as_ref() else {
+            return Ok(());
+        };
+        if auth.token().is_some() {
+            return Ok(());
+        }
+        self.refresh().await
+    }
+
+    /// Force a fresh login and replace the held token.
+    ///
+    /// A no-op when no auth source is configured. Acquires a new JWT via Entrez,
+    /// validates it against the device, and stores it.
+    async fn refresh(&self) -> Result<()> {
+        let Some(auth) = self.auth.as_ref() else {
+            return Ok(());
+        };
+        let token = auth.acquire_token().await?;
+        self.authenticate(&token).await?;
+        auth.set_token(token);
+        Ok(())
+    }
+
+    /// Run an operation, refreshing the token once on `Unauthorized`.
+    ///
+    /// With no auth source, runs `op` once and returns its result unchanged —
+    /// so an externally authenticated client behaves exactly as before. With an
+    /// auth source: ensures a token, runs `op`, and if it returns
+    /// [`Unauthorized`](crate::error::EnphaseError::Unauthorized) refreshes the
+    /// token and runs `op` exactly once more.
+    async fn with_auth_retry<T>(&self, op: impl AsyncFn() -> Result<T>) -> Result<T> {
+        if self.auth.is_none() {
+            return op().await;
+        }
+
+        self.ensure_authenticated().await?;
+
+        match op().await {
+            Err(crate::error::EnphaseError::Unauthorized(_)) => {
+                self.refresh().await?;
+                op().await
+            }
+            other => other,
+        }
     }
 
     /// Authenticate with the Envoy device using a JWT token.
@@ -255,32 +382,37 @@ impl Envoy {
     pub async fn set_power_state(&self, serial: impl Display, state: PowerState) -> Result<()> {
         debug!(?state, "Setting power state");
 
-        let endpoint = format!("{}/ivp/mod/{}/mode/power", self.base_url, serial);
-        debug!("PUT {endpoint}");
+        let serial_str = serial.to_string();
 
-        // Build the JSON payload
-        let payload = format!(r#"{{"length":1,"arr":[{}]}}"#, state.payload_value());
+        self.with_auth_retry(async || {
+            let endpoint = format!("{}/ivp/mod/{serial_str}/mode/power", self.base_url);
+            debug!("PUT {endpoint}");
 
-        let response = self
-            .client
-            .put(&endpoint)
-            .header(
-                "Content-Type",
-                // This is not an error. Envoy expects the x-www-form-urlencoded
-                // content type, while the body is actually JSON.
-                "application/x-www-form-urlencoded; charset=UTF-8",
-            )
-            .body(payload)
-            .send()
-            .await?;
+            // Build the JSON payload
+            let payload = format!(r#"{{"length":1,"arr":[{}]}}"#, state.payload_value());
 
-        let status = response.status();
-        debug!("Status code: {}", status);
+            let response = self
+                .client
+                .put(&endpoint)
+                .header(
+                    "Content-Type",
+                    // This is not an error. Envoy expects the x-www-form-urlencoded
+                    // content type, while the body is actually JSON.
+                    "application/x-www-form-urlencoded; charset=UTF-8",
+                )
+                .body(payload)
+                .send()
+                .await?;
 
-        // The endpoint returns 204 No Content on success (any 2xx is accepted).
-        check_status(status, "set power state")?;
-        debug!("Power state set successfully");
-        Ok(())
+            let status = response.status();
+            debug!("Status code: {}", status);
+
+            // The endpoint returns 204 No Content on success (any 2xx is accepted).
+            check_status(status, "set power state")?;
+            debug!("Power state set successfully");
+            Ok(())
+        })
+        .await
     }
 
     /// Get the power state of an inverter or device.
@@ -318,29 +450,34 @@ impl Envoy {
     pub async fn get_power_state(&self, serial: impl Display) -> Result<bool> {
         debug!("Getting power state");
 
-        let endpoint = format!("{}/ivp/mod/{}/mode/power", self.base_url, serial);
-        debug!("GET {endpoint}");
+        let serial_str = serial.to_string();
 
-        let response = self
-            .client
-            .get(&endpoint)
-            .header("Accept", "application/json, text/javascript, */*; q=0.01")
-            .send()
-            .await?;
+        self.with_auth_retry(async || {
+            let endpoint = format!("{}/ivp/mod/{serial_str}/mode/power", self.base_url);
+            debug!("GET {endpoint}");
 
-        let status_code = response.status();
-        debug!("Status code: {}", status_code);
+            let response = self
+                .client
+                .get(&endpoint)
+                .header("Accept", "application/json, text/javascript, */*; q=0.01")
+                .send()
+                .await?;
 
-        check_status(status_code, "get power state")?;
+            let status_code = response.status();
+            debug!("Status code: {}", status_code);
 
-        let body = response.text().await?;
-        debug!("Response body: {}", body);
+            check_status(status_code, "get power state")?;
 
-        let status: PowerStatusResponse = serde_json::from_str(&body)?;
-        debug!(?status, "Parsed power status");
+            let body = response.text().await?;
+            debug!("Response body: {}", body);
 
-        // powerForcedOff: true means power is OFF, so we invert it
-        Ok(!status.power_forced_off)
+            let status: PowerStatusResponse = serde_json::from_str(&body)?;
+            debug!(?status, "Parsed power status");
+
+            // powerForcedOff: true means power is OFF, so we invert it
+            Ok(!status.power_forced_off)
+        })
+        .await
     }
 
     /// Enumerate the array's inverter serial numbers.
@@ -378,32 +515,35 @@ impl Envoy {
     pub async fn get_inverters(&self) -> Result<Vec<String>> {
         debug!("Getting inverter inventory");
 
-        let endpoint = format!("{}/inventory.json", self.base_url);
-        debug!("GET {endpoint}");
+        self.with_auth_retry(async || {
+            let endpoint = format!("{}/inventory.json", self.base_url);
+            debug!("GET {endpoint}");
 
-        let response = self
-            .client
-            .get(&endpoint)
-            .header("Accept", "application/json, text/javascript, */*; q=0.01")
-            .send()
-            .await?;
+            let response = self
+                .client
+                .get(&endpoint)
+                .header("Accept", "application/json, text/javascript, */*; q=0.01")
+                .send()
+                .await?;
 
-        let status = response.status();
-        debug!("Status code: {}", status);
+            let status = response.status();
+            debug!("Status code: {}", status);
 
-        check_status(status, "get inventory")?;
+            check_status(status, "get inventory")?;
 
-        let body = response.text().await?;
-        debug!("Response body: {}", body);
+            let body = response.text().await?;
+            debug!("Response body: {}", body);
 
-        let sections: Vec<InventorySection> = serde_json::from_str(&body)?;
+            let sections: Vec<InventorySection> = serde_json::from_str(&body)?;
 
-        Ok(sections
-            .into_iter()
-            .filter(|section| section.type_field == "PCU")
-            .flat_map(|section| section.devices)
-            .map(|device| device.serial_num)
-            .collect())
+            Ok(sections
+                .into_iter()
+                .filter(|section| section.type_field == "PCU")
+                .flat_map(|section| section.devices)
+                .map(|device| device.serial_num)
+                .collect())
+        })
+        .await
     }
 
     /// Post a DPEL settings payload to the device.
@@ -413,31 +553,35 @@ impl Envoy {
     /// `{dynamic_pel_settings, filename, version}` envelope and differ only in
     /// the settings they carry.
     async fn post_dpel(&self, settings: DpelSettings) -> Result<()> {
-        let endpoint = format!("{}/ivp/ss/dpel", self.base_url);
-        debug!("POST {endpoint}");
+        self.with_auth_retry(async || {
+            let endpoint = format!("{}/ivp/ss/dpel", self.base_url);
+            debug!("POST {endpoint}");
 
-        let body = serde_json::to_string(&DpelRequest {
-            dynamic_pel_settings: settings,
-            filename: "site_settings",
-            version: "00.00.01",
-        })?;
+            let body = serde_json::to_string(&DpelRequest {
+                // Cloned so the request can be rebuilt if the auth retry fires.
+                dynamic_pel_settings: settings.clone(),
+                filename: "site_settings",
+                version: "00.00.01",
+            })?;
 
-        let response = self
-            .client
-            .post(&endpoint)
-            .header("Content-Type", "application/json")
-            .body(body)
-            .send()
-            .await?;
+            let response = self
+                .client
+                .post(&endpoint)
+                .header("Content-Type", "application/json")
+                .body(body)
+                .send()
+                .await?;
 
-        let status = response.status();
-        debug!("Status code: {}", status);
+            let status = response.status();
+            debug!("Status code: {}", status);
 
-        // The device's exact success status for this endpoint is unverified
-        // (the spec documents the body, not the code); accept any 2xx.
-        check_status(status, "set DPEL settings")?;
-        debug!("DPEL settings accepted");
-        Ok(())
+            // The device's exact success status for this endpoint is unverified
+            // (the spec documents the body, not the code); accept any 2xx.
+            check_status(status, "set DPEL settings")?;
+            debug!("DPEL settings accepted");
+            Ok(())
+        })
+        .await
     }
 
     /// Set the grid export limit (DPEL / zero-export).
@@ -559,26 +703,29 @@ impl Envoy {
     pub async fn get_dpel(&self) -> Result<DpelSettings> {
         debug!("Getting DPEL settings");
 
-        let endpoint = format!("{}/ivp/ss/dpel", self.base_url);
-        debug!("GET {endpoint}");
+        self.with_auth_retry(async || {
+            let endpoint = format!("{}/ivp/ss/dpel", self.base_url);
+            debug!("GET {endpoint}");
 
-        let response = self
-            .client
-            .get(&endpoint)
-            .header("Accept", "application/json, text/javascript, */*; q=0.01")
-            .send()
-            .await?;
+            let response = self
+                .client
+                .get(&endpoint)
+                .header("Accept", "application/json, text/javascript, */*; q=0.01")
+                .send()
+                .await?;
 
-        let status = response.status();
-        debug!("Status code: {}", status);
+            let status = response.status();
+            debug!("Status code: {}", status);
 
-        check_status(status, "get DPEL settings")?;
+            check_status(status, "get DPEL settings")?;
 
-        let body = response.text().await?;
-        debug!("Response body: {}", body);
+            let body = response.text().await?;
+            debug!("Response body: {}", body);
 
-        let parsed: DpelResponse = serde_json::from_str(&body)?;
-        Ok(parsed.dynamic_pel_settings)
+            let parsed: DpelResponse = serde_json::from_str(&body)?;
+            Ok(parsed.dynamic_pel_settings)
+        })
+        .await
     }
 
     /// Get the grid profiles available on the Envoy.
@@ -613,26 +760,29 @@ impl Envoy {
     pub async fn get_grid_profiles(&self) -> Result<AgfIndexResponse> {
         debug!("Getting grid profiles");
 
-        let endpoint = format!("{}/installer/agf/index.json", self.base_url);
-        debug!("GET {endpoint}");
+        self.with_auth_retry(async || {
+            let endpoint = format!("{}/installer/agf/index.json", self.base_url);
+            debug!("GET {endpoint}");
 
-        let response = self
-            .client
-            .get(&endpoint)
-            .header("Accept", "application/json, text/javascript, */*; q=0.01")
-            .send()
-            .await?;
+            let response = self
+                .client
+                .get(&endpoint)
+                .header("Accept", "application/json, text/javascript, */*; q=0.01")
+                .send()
+                .await?;
 
-        let status = response.status();
-        debug!("Status code: {}", status);
+            let status = response.status();
+            debug!("Status code: {}", status);
 
-        check_status(status, "get grid profiles")?;
+            check_status(status, "get grid profiles")?;
 
-        let body = response.text().await?;
-        debug!("Response body: {}", body);
+            let body = response.text().await?;
+            debug!("Response body: {}", body);
 
-        let index: AgfIndexResponse = serde_json::from_str(&body)?;
-        Ok(index)
+            let index: AgfIndexResponse = serde_json::from_str(&body)?;
+            Ok(index)
+        })
+        .await
     }
 
     /// Select an AS/NZS 4777.2 grid profile by identifier.
@@ -674,36 +824,41 @@ impl Envoy {
     pub async fn select_grid_profile(&self, profile_id: impl Display) -> Result<()> {
         debug!("Selecting grid profile");
 
-        let endpoint = format!("{}/installer/agf/set_profile.json", self.base_url);
-        debug!("PUT {endpoint}");
+        let profile_id_str = profile_id.to_string();
 
-        // Serialize the body so the id is JSON-escaped. For a normal id (e.g.
-        // "AUS_A:1.2") this is byte-identical to the literal form — the colon
-        // round-trips unescaped — while a quote or backslash is escaped rather
-        // than producing malformed JSON.
-        let payload = serde_json::json!({ "selected_profile": profile_id.to_string() }).to_string();
+        self.with_auth_retry(async || {
+            let endpoint = format!("{}/installer/agf/set_profile.json", self.base_url);
+            debug!("PUT {endpoint}");
 
-        let response = self
-            .client
-            .put(&endpoint)
-            .header(
-                "Content-Type",
-                // As with set_power_state, the Envoy expects this form content
-                // type while the body is actually JSON.
-                "application/x-www-form-urlencoded; charset=UTF-8",
-            )
-            .body(payload)
-            .send()
-            .await?;
+            // Serialize the body so the id is JSON-escaped. For a normal id (e.g.
+            // "AUS_A:1.2") this is byte-identical to the literal form — the colon
+            // round-trips unescaped — while a quote or backslash is escaped rather
+            // than producing malformed JSON.
+            let payload = serde_json::json!({ "selected_profile": &profile_id_str }).to_string();
 
-        let status = response.status();
-        debug!("Status code: {}", status);
+            let response = self
+                .client
+                .put(&endpoint)
+                .header(
+                    "Content-Type",
+                    // As with set_power_state, the Envoy expects this form content
+                    // type while the body is actually JSON.
+                    "application/x-www-form-urlencoded; charset=UTF-8",
+                )
+                .body(payload)
+                .send()
+                .await?;
 
-        // The device's exact success status for this endpoint is unverified;
-        // accept any 2xx (pinned against hardware in phase 2).
-        check_status(status, "select grid profile")?;
-        debug!("Grid profile selected");
-        Ok(())
+            let status = response.status();
+            debug!("Status code: {}", status);
+
+            // The device's exact success status for this endpoint is unverified;
+            // accept any 2xx (pinned against hardware in phase 2).
+            check_status(status, "select grid profile")?;
+            debug!("Grid profile selected");
+            Ok(())
+        })
+        .await
     }
 
     /// Upload a grid-profile package to the Envoy.
@@ -746,32 +901,38 @@ impl Envoy {
     pub async fn upload_grid_profile(&self, package: Vec<u8>) -> Result<()> {
         debug!(bytes = package.len(), "Uploading grid profile package");
 
-        let endpoint = format!("{}/installer/agf/upload_profile_package", self.base_url);
-        debug!("POST {endpoint}");
+        self.with_auth_retry(async || {
+            let endpoint = format!("{}/installer/agf/upload_profile_package", self.base_url);
+            debug!("POST {endpoint}");
 
-        // The device requires the part to be named `file`; a wrong name fails
-        // silently on-device.
-        let form = reqwest::multipart::Form::new().part(
-            "file",
-            reqwest::multipart::Part::bytes(package).file_name("grid_profile.json"),
-        );
+            // The device requires the part to be named `file`; a wrong name fails
+            // silently on-device. The bytes are cloned so the multipart form can
+            // be rebuilt if the auth retry fires.
+            let form = reqwest::multipart::Form::new().part(
+                "file",
+                reqwest::multipart::Part::bytes(package.clone()).file_name("grid_profile.json"),
+            );
 
-        let response = self.client.post(&endpoint).multipart(form).send().await?;
+            let response = self.client.post(&endpoint).multipart(form).send().await?;
 
-        let status = response.status();
-        debug!("Status code: {}", status);
+            let status = response.status();
+            debug!("Status code: {}", status);
 
-        // The device's exact success status for this endpoint is unverified;
-        // accept any 2xx (pinned against hardware in phase 2).
-        check_status(status, "upload grid profile package")?;
-        debug!("Grid profile package uploaded");
-        Ok(())
+            // The device's exact success status for this endpoint is unverified;
+            // accept any 2xx (pinned against hardware in phase 2).
+            check_status(status, "upload grid profile package")?;
+            debug!("Grid profile package uploaded");
+            Ok(())
+        })
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::auth::{AuthState, Credentials};
+    use crate::client::entrez::Entrez;
     use crate::models::PowerState;
     use pretty_assertions::assert_eq;
     use wiremock::matchers::{body_string, body_string_contains, header, method, path};
@@ -819,6 +980,7 @@ mod tests {
         Envoy {
             client: test_client,
             base_url: mock_server.uri(),
+            auth: None,
         }
     }
 
@@ -1336,5 +1498,170 @@ mod tests {
                 "Error should be Unauthorized type, got {err:?}"
             );
         }
+    }
+
+    /// Build a plain-HTTP `reqwest::Client` (cookie store enabled) for mocks.
+    fn test_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .cookie_store(true)
+            .timeout(core::time::Duration::from_secs(30))
+            .build()
+            .expect("Failed to build test client")
+    }
+
+    /// Build an `Envoy` with an auth source pointed at mock servers.
+    ///
+    /// Mirrors [`test_envoy`] but attaches an [`AuthState`] so the auth state
+    /// machine (login → token → authenticate, refresh-on-`Unauthorized`) is
+    /// exercised over `wiremock`'s plain HTTP. `with_auth` itself prefixes
+    /// `https://` and is covered by the ignored integration test.
+    fn test_envoy_with_auth(
+        envoy_server: &MockServer,
+        entrez: Entrez,
+        credentials: Credentials,
+    ) -> Envoy {
+        Envoy {
+            client: test_http_client(),
+            base_url: envoy_server.uri(),
+            auth: Some(Arc::new(AuthState::new(entrez, credentials))),
+        }
+    }
+
+    /// Build an `Entrez` client pointed at a mock server over plain HTTP.
+    fn test_entrez(entrez_server: &MockServer) -> Entrez {
+        Entrez::with_client(entrez_server.uri(), test_http_client())
+    }
+
+    /// Build test [`Credentials`].
+    fn test_credentials() -> Credentials {
+        Credentials::new("user@example.com", "password", "My Site", "121212121212")
+    }
+
+    /// Mount the Entrez login + token endpoints on a mock server, each expecting
+    /// exactly `times` hits (verified on server drop).
+    async fn mount_entrez(entrez_server: &MockServer, times: u64) {
+        Mock::given(method("POST"))
+            .and(path("/login"))
+            .respond_with(ResponseTemplate::new(200).append_header("Set-Cookie", "s=1; Path=/"))
+            .expect(times)
+            .mount(entrez_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/entrez_tokens"))
+            .respond_with(fixture_response("entrez", "generate-token-success"))
+            .expect(times)
+            .mount(entrez_server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn with_auth_refreshes_on_unauthorized() {
+        let entrez_server = MockServer::start().await;
+        let envoy_server = MockServer::start().await;
+
+        // Entrez login + token are hit twice: once for the initial auth, once
+        // for the refresh after the first 401.
+        mount_entrez(&entrez_server, 2).await;
+
+        // The Envoy accepts the JWT and, on the control call, returns 401 the
+        // first time then 204.
+        Mock::given(method("GET"))
+            .and(path("/auth/check_jwt"))
+            .respond_with(fixture_response("envoy", "authenticate-valid"))
+            .mount(&envoy_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/ivp/mod/603980032/mode/power"))
+            .respond_with(ResponseTemplate::new(401))
+            .up_to_n_times(1)
+            .mount(&envoy_server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/ivp/mod/603980032/mode/power"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&envoy_server)
+            .await;
+
+        let envoy = test_envoy_with_auth(
+            &envoy_server,
+            test_entrez(&entrez_server),
+            test_credentials(),
+        );
+
+        let result = envoy.set_power_state("603980032", PowerState::On).await;
+
+        assert!(
+            result.is_ok(),
+            "set_power_state should succeed after a refresh. Error: {:?}",
+            result.err()
+        );
+        // Entrez expectations (expect(2)) are verified when the servers drop.
+    }
+
+    #[tokio::test]
+    async fn with_auth_still_unauthorized_returns_err() {
+        let entrez_server = MockServer::start().await;
+        let envoy_server = MockServer::start().await;
+
+        // Refresh happens exactly once: initial auth + one refresh = 2 hits each.
+        mount_entrez(&entrez_server, 2).await;
+
+        Mock::given(method("GET"))
+            .and(path("/auth/check_jwt"))
+            .respond_with(fixture_response("envoy", "authenticate-valid"))
+            .mount(&envoy_server)
+            .await;
+        // Always 401; expect exactly two attempts (initial + one retry).
+        Mock::given(method("PUT"))
+            .and(path("/ivp/mod/603980032/mode/power"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(2)
+            .mount(&envoy_server)
+            .await;
+
+        let envoy = test_envoy_with_auth(
+            &envoy_server,
+            test_entrez(&entrez_server),
+            test_credentials(),
+        );
+
+        let result = envoy.set_power_state("603980032", PowerState::On).await;
+
+        assert!(result.is_err(), "a persistent 401 should return an error");
+        if let Err(err) = result {
+            assert!(
+                matches!(err, crate::error::EnphaseError::Unauthorized(_)),
+                "Error should be Unauthorized type, got {err:?}"
+            );
+        }
+        // envoy.expect(2) and entrez.expect(2) are verified on server drop,
+        // proving the retry happens exactly once.
+    }
+
+    #[tokio::test]
+    async fn no_auth_envoy_surfaces_unauthorized() {
+        let envoy_server = MockServer::start().await;
+
+        // A no-auth Envoy must not retry: exactly one request, 401 surfaced.
+        Mock::given(method("PUT"))
+            .and(path("/ivp/mod/603980032/mode/power"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&envoy_server)
+            .await;
+
+        let envoy = test_envoy(&envoy_server);
+
+        let result = envoy.set_power_state("603980032", PowerState::On).await;
+
+        assert!(result.is_err(), "HTTP 401 should produce an error");
+        if let Err(err) = result {
+            assert!(
+                matches!(err, crate::error::EnphaseError::Unauthorized(_)),
+                "Error should be Unauthorized type, got {err:?}"
+            );
+        }
+        // No Entrez server exists; a login attempt would fail the test.
+        // envoy.expect(1) verifies no retry occurred.
     }
 }
