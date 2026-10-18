@@ -80,6 +80,32 @@ pub struct AgfIndexResponse {
     pub profiles: Vec<GridProfile>,
 }
 
+/// A single device entry within an [`InventorySection`].
+///
+/// The device reports more per-device metadata than is modelled here; only the
+/// serial number is captured, and unknown JSON fields are ignored.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
+pub struct InventoryDevice {
+    /// The device's serial number.
+    pub serial_num: String,
+}
+
+/// A section of the Envoy inventory returned by `GET /inventory.json`.
+///
+/// The inventory is an array of sections, each grouping devices of one type.
+/// Inverters appear in the section whose `type` is `"PCU"` (power conditioning
+/// unit).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
+pub struct InventorySection {
+    /// The section type (e.g. `"PCU"` for inverters).
+    #[serde(rename = "type")]
+    pub type_field: String,
+    /// The devices in this section.
+    pub devices: Vec<InventoryDevice>,
+}
+
 impl PowerState {
     /// Get the payload array value for this power state.
     pub(crate) fn payload_value(self) -> u8 {

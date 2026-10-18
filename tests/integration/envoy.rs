@@ -150,6 +150,39 @@ async fn authenticate_and_get_grid_profiles() -> Result<(), Box<dyn core::error:
 }
 
 #[tokio::test]
+#[ignore = "Requires local Envoy device and Enphase credentials"]
+async fn authenticate_and_get_inverters() -> Result<(), Box<dyn core::error::Error>> {
+    has_credentials()?;
+
+    let envoy_host = std::env::var("ENVOY_HOST")?;
+    let envoy_name = std::env::var("ENVOY_NAME")?;
+    let envoy_serial = std::env::var("ENVOY_SERIAL_NUMBER")?;
+
+    // Step 1: Create Entrez client and generate JWT token
+    let entrez = Entrez::default();
+    entrez.login_with_env().await?;
+    let token = entrez
+        .generate_token(&envoy_name, &envoy_serial, true)
+        .await?;
+    println!("Generated JWT token for authentication");
+
+    // Step 2: Create Envoy client and authenticate with the token
+    let envoy = Envoy::new(&envoy_host);
+    envoy.authenticate(&token).await?;
+    println!("Successfully authenticated with Envoy device");
+
+    // Step 3: Enumerate the array's inverters.
+    //
+    // TODO(phase-2): confirm the real /inventory.json section type and serial
+    // field names against the device; the model assumes a top-level array of
+    // sections with type == "PCU" and devices[].serial_num.
+    let serials = envoy.get_inverters().await?;
+    println!("Found {} inverters: {serials:?}", serials.len());
+
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "Requires local Envoy device, Enphase credentials, and ENVOY_PROFILE_PACKAGE"]
 async fn authenticate_and_upload_grid_profile() -> Result<(), Box<dyn core::error::Error>> {
     has_credentials()?;

@@ -18,7 +18,10 @@ use core::fmt::Display;
 
 use crate::{
     error::Result,
-    models::{AgfIndexResponse, DpelResponse, DpelSettings, PowerState, PowerStatusResponse},
+    models::{
+        AgfIndexResponse, DpelResponse, DpelSettings, InventorySection, PowerState,
+        PowerStatusResponse,
+    },
 };
 use serde::Serialize;
 use tracing::{debug, instrument};
@@ -338,6 +341,69 @@ impl Envoy {
 
         // powerForcedOff: true means power is OFF, so we invert it
         Ok(!status.power_forced_off)
+    }
+
+    /// Enumerate the array's inverter serial numbers.
+    ///
+    /// Reads `/inventory.json` and returns the serial numbers of every device
+    /// in the `PCU` (power conditioning unit) sections, in document order. The
+    /// result drives whole-array controls that must act on each inverter.
+    ///
+    /// # Returns
+    ///
+    /// Returns the inverter serial numbers. An inventory with no `PCU` section
+    /// yields an empty vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnphaseError::Unauthorized`](crate::error::EnphaseError::Unauthorized)
+    /// on HTTP 401, or another error if the request fails or the response
+    /// cannot be parsed.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use enphase_api::Envoy;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = Envoy::new("envoy.local");
+    /// let serials = client.get_inverters().await?;
+    /// println!("{} inverters", serials.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    #[instrument(skip(self), level = "debug")]
+    pub async fn get_inverters(&self) -> Result<Vec<String>> {
+        debug!("Getting inverter inventory");
+
+        let endpoint = format!("{}/inventory.json", self.base_url);
+        debug!("GET {endpoint}");
+
+        let response = self
+            .client
+            .get(&endpoint)
+            .header("Accept", "application/json, text/javascript, */*; q=0.01")
+            .send()
+            .await?;
+
+        let status = response.status();
+        debug!("Status code: {}", status);
+
+        check_status(status, "get inventory")?;
+
+        let body = response.text().await?;
+        debug!("Response body: {}", body);
+
+        let sections: Vec<InventorySection> = serde_json::from_str(&body)?;
+
+        Ok(sections
+            .into_iter()
+            .filter(|section| section.type_field == "PCU")
+            .flat_map(|section| section.devices)
+            .map(|device| device.serial_num)
+            .collect())
     }
 
     /// Post a DPEL settings payload to the device.
@@ -1186,6 +1252,82 @@ mod tests {
         let client = test_envoy(&mock_server);
 
         let result = client.get_grid_profiles().await;
+
+        assert!(result.is_err(), "HTTP 401 should produce an error");
+        if let Err(err) = result {
+            assert!(
+                matches!(err, crate::error::EnphaseError::Unauthorized(_)),
+                "Error should be Unauthorized type, got {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_inverters_parses() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/inventory.json"))
+            .respond_with(fixture_response("envoy", "inventory"))
+            .mount(&mock_server)
+            .await;
+
+        let client = test_envoy(&mock_server);
+
+        let serials = client
+            .get_inverters()
+            .await
+            .expect("get_inverters should succeed");
+
+        assert_eq!(
+            serials,
+            vec!["482412345678".to_owned(), "482412345679".to_owned()],
+            "get_inverters should return the PCU serials in document order"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_inverters_empty_when_no_pcu() {
+        let mock_server = MockServer::start().await;
+
+        // An inventory with no PCU section (only a non-inverter section) must
+        // yield an empty list, not an error.
+        Mock::given(method("GET"))
+            .and(path("/inventory.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"[{"type":"NSRB","devices":[{"serial_num":"123456789012"}]}]"#,
+                ),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = test_envoy(&mock_server);
+
+        let serials = client
+            .get_inverters()
+            .await
+            .expect("get_inverters should succeed on a PCU-less inventory");
+
+        assert!(
+            serials.is_empty(),
+            "an inventory with no PCU section should yield an empty list, got {serials:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_inverters_unauthorized() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/inventory.json"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&mock_server)
+            .await;
+
+        let client = test_envoy(&mock_server);
+
+        let result = client.get_inverters().await;
 
         assert!(result.is_err(), "HTTP 401 should produce an error");
         if let Err(err) = result {
