@@ -5,7 +5,10 @@
 //! unit-tested with a mock. [`EnvoyControls`] is the real implementation, a thin
 //! wrapper over the library's self-authenticating [`enphase_api::Envoy`].
 
+use core::future::Future;
+
 use async_trait::async_trait;
+use tracing::warn;
 
 use enphase_api::Envoy;
 use enphase_api::models::PowerState;
@@ -46,6 +49,34 @@ pub struct GridProfiles {
 #[must_use]
 pub fn quorum_on(states: &[bool]) -> bool {
     !states.is_empty() && states.iter().all(|&state| state)
+}
+
+/// Run an async operation, retrying it once if the first attempt fails.
+///
+/// Addresses the documented "an inverter sometimes stays off, retry" case: a
+/// single transient failure is absorbed; a persistent one surfaces the second
+/// error.
+///
+/// # Arguments
+///
+/// * `operation` - The operation to run; it may be called twice.
+///
+/// # Returns
+///
+/// The first success, or the error from the second attempt.
+///
+/// # Errors
+///
+/// Returns the second attempt's error when both attempts fail.
+async fn retry_once<T, F, Fut>(operation: F) -> anyhow::Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    if let Ok(value) = operation().await {
+        return Ok(value);
+    }
+    operation().await
 }
 
 /// The Enphase operations the bridge issues against the gateway.
@@ -151,10 +182,33 @@ impl EnphaseControls for EnvoyControls {
     #[inline]
     async fn set_panels(&self, on: bool) -> anyhow::Result<()> {
         let state = if on { PowerState::On } else { PowerState::Off };
-        for serial in self.envoy.get_inverters().await? {
-            self.envoy.set_power_state(serial, state).await?;
+        let serials = self.envoy.get_inverters().await?;
+        if serials.is_empty() {
+            warn!("no inverters enumerated; panels command had no effect");
         }
-        Ok(())
+
+        // Attempt every inverter (retrying each once) so a single bad inverter
+        // does not leave the rest of the array untouched; surface the first
+        // persistent failure.
+        let mut first_error: Option<anyhow::Error> = None;
+        for serial in serials {
+            let outcome = retry_once(|| async {
+                self.envoy.set_power_state(&serial, state).await?;
+                Ok(())
+            })
+            .await;
+            if let Err(err) = outcome {
+                warn!("failed to set inverter {serial}: {err:#}");
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     #[inline]
@@ -212,6 +266,8 @@ impl EnphaseControls for EnvoyControls {
 mod tests {
     use super::*;
 
+    use pretty_assertions::assert_eq;
+
     #[test]
     fn quorum_on_all_true() {
         assert!(quorum_on(&[true, true]));
@@ -225,6 +281,36 @@ mod tests {
     #[test]
     fn quorum_on_empty_false() {
         assert!(!quorum_on(&[]));
+    }
+
+    #[tokio::test]
+    async fn retry_once_succeeds_on_second_attempt() {
+        use core::sync::atomic::{AtomicU32, Ordering};
+
+        let calls = AtomicU32::new(0);
+        let result = retry_once(|| async {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                anyhow::bail!("first attempt fails");
+            }
+            Ok(42_u32)
+        })
+        .await;
+        assert_eq!(result.expect("retry succeeds"), 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_once_fails_after_two_attempts() {
+        use core::sync::atomic::{AtomicU32, Ordering};
+
+        let calls = AtomicU32::new(0);
+        let result: anyhow::Result<u32> = retry_once(|| async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("always fails")
+        })
+        .await;
+        let _err = result.expect_err("both attempts fail");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
