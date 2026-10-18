@@ -13,6 +13,7 @@
 
 mod controls;
 mod discovery;
+mod dispatch;
 mod payload;
 mod topics;
 
@@ -21,5 +22,6 @@ pub mod version;
 
 pub use controls::{EnphaseControls, EnvoyControls, ExportLimit, GridProfiles, quorum_on};
 pub use discovery::{DiscoveryMessage, discovery_configs};
+pub use dispatch::handle_command;
 pub use payload::{BridgeState, Command, parse_command, state_messages};
 pub use topics::BridgeTopics;
