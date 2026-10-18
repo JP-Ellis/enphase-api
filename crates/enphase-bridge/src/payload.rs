@@ -1,7 +1,8 @@
-//! Command and state payload codec.
+//! Command payload codec.
 //!
-//! Pure functions that translate between MQTT payloads and the bridge's typed
-//! [`Command`] / [`BridgeState`] values.
+//! Pure functions that translate MQTT command payloads into the bridge's typed
+//! [`Command`] values. State publishing is produced by the
+//! [`StateCache`](crate::cache::StateCache).
 
 use crate::topics::BridgeTopics;
 
@@ -15,20 +16,6 @@ pub enum Command {
     SetExportLimit(f64),
     /// Select the grid profile with the given id.
     SelectGridProfile(String),
-}
-
-/// The bridge's view of the device state, for publishing to state topics.
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub struct BridgeState {
-    /// Whether the whole panel array is on.
-    pub panels_on: bool,
-    /// Whether zero-export (DPEL export limiting) is enabled.
-    pub zero_export_on: bool,
-    /// The current export limit, in watts.
-    pub export_limit_w: f64,
-    /// The id of the currently selected grid profile.
-    pub selected_profile: String,
 }
 
 /// Parse an MQTT switch payload (`ON`/`OFF`, case-insensitive) into a bool.
@@ -96,62 +83,6 @@ pub fn parse_command(
     } else {
         None
     }
-}
-
-/// Format a watt value for a state topic.
-///
-/// Integral values print without a trailing decimal (e.g. `5000`), so Home
-/// Assistant's number entity reads a clean value.
-///
-/// # Arguments
-///
-/// * `watts` - The export limit, in watts.
-///
-/// # Returns
-///
-/// The formatted string.
-fn format_watts(watts: f64) -> String {
-    if !watts.is_finite() {
-        // A non-finite device value would publish "NaN"/"inf", which Home
-        // Assistant's number entity cannot parse; publish a safe 0 instead.
-        return "0".to_owned();
-    }
-    if watts.fract() == 0.0 {
-        format!("{watts:.0}")
-    } else {
-        format!("{watts}")
-    }
-}
-
-/// Build the retained state messages for the current device state.
-///
-/// # Arguments
-///
-/// * `topics` - The bridge's topic layout.
-/// * `state` - The device state to publish.
-///
-/// # Returns
-///
-/// `(topic, payload)` pairs for the four state topics, in entity order.
-#[inline]
-#[must_use]
-pub fn state_messages(topics: &BridgeTopics, state: &BridgeState) -> Vec<(String, String)> {
-    let on_off = |on: bool| if on { "ON" } else { "OFF" }.to_owned();
-    vec![
-        (topics.panels_state.clone(), on_off(state.panels_on)),
-        (
-            topics.zero_export_state.clone(),
-            on_off(state.zero_export_on),
-        ),
-        (
-            topics.export_limit_state.clone(),
-            format_watts(state.export_limit_w),
-        ),
-        (
-            topics.grid_profile_state.clone(),
-            state.selected_profile.clone(),
-        ),
-    ]
 }
 
 #[cfg(test)]
@@ -280,41 +211,5 @@ mod tests {
             parse_command(&topics.grid_profile_command, b"   ", &topics, TEST_CAP),
             None
         );
-    }
-
-    #[test]
-    fn format_watts_handles_non_finite() {
-        let topics = BridgeTopics::new("enphase");
-        let state = BridgeState {
-            panels_on: false,
-            zero_export_on: false,
-            export_limit_w: f64::NAN,
-            selected_profile: String::new(),
-        };
-        let msgs = state_messages(&topics, &state);
-        let export = msgs
-            .iter()
-            .find(|(topic, _)| *topic == topics.export_limit_state)
-            .expect("export-limit state message present");
-        assert_eq!(export.1, "0");
-    }
-
-    #[test]
-    fn state_messages_formats() {
-        let topics = BridgeTopics::new("enphase");
-        let state = BridgeState {
-            panels_on: true,
-            zero_export_on: false,
-            export_limit_w: 5000.0,
-            selected_profile: "AUS_A:1.2".to_owned(),
-        };
-        let msgs = state_messages(&topics, &state);
-        let expected = vec![
-            (topics.panels_state.clone(), "ON".to_owned()),
-            (topics.zero_export_state.clone(), "OFF".to_owned()),
-            (topics.export_limit_state.clone(), "5000".to_owned()),
-            (topics.grid_profile_state.clone(), "AUS_A:1.2".to_owned()),
-        ];
-        assert_eq!(msgs, expected);
     }
 }

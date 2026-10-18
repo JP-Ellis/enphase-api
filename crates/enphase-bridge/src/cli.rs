@@ -85,6 +85,32 @@ pub struct Args {
     )]
     pub poll_interval: u64,
 
+    /// The export-limit number's maximum, in watts (the owner's regulatory cap).
+    #[arg(
+        long,
+        env = "EXPORT_LIMIT_MAX",
+        default_value_t = crate::discovery::DEFAULT_EXPORT_LIMIT_MAX
+    )]
+    pub export_limit_max: f64,
+
+    /// Attempts to apply a command before reverting to last-known-good.
+    #[arg(
+        long,
+        env = "COMMAND_RETRIES",
+        default_value_t = 2,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub command_retries: u32,
+
+    /// Consecutive failed polls before an entity is marked unavailable.
+    #[arg(
+        long,
+        env = "POLL_FAILURE_THRESHOLD",
+        default_value_t = 3,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub poll_failure_threshold: u32,
+
     /// Optional subcommand; absent means "run the bridge".
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -125,6 +151,47 @@ mod tests {
         assert!(args.command.is_none());
         assert_eq!(args.poll_interval, 30);
         assert_eq!(args.topic_prefix, "enphase");
+    }
+
+    #[test]
+    fn cli_parses_resilience_knobs() {
+        let args = Args::try_parse_from([
+            "enphase-bridge",
+            "--username",
+            "user",
+            "--password",
+            "pass",
+            "--host",
+            "envoy.local",
+            "--site-name",
+            "Site",
+            "--serial-number",
+            "121212121212",
+        ])
+        .expect("args parse");
+        assert!((args.export_limit_max - 5_000.0_f64).abs() < f64::EPSILON);
+        assert_eq!(args.command_retries, 2);
+        assert_eq!(args.poll_failure_threshold, 3);
+    }
+
+    #[test]
+    fn poll_failure_threshold_rejects_zero() {
+        let result = Args::try_parse_from([
+            "enphase-bridge",
+            "--username",
+            "user",
+            "--password",
+            "pass",
+            "--host",
+            "envoy.local",
+            "--site-name",
+            "Site",
+            "--serial-number",
+            "121212121212",
+            "--poll-failure-threshold",
+            "0",
+        ]);
+        let _err = result.expect_err("zero threshold is rejected");
     }
 
     #[test]

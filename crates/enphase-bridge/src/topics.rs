@@ -16,10 +16,6 @@ pub struct BridgeTopics {
     pub panels_state: String,
     /// Command topic for the panels switch.
     pub panels_command: String,
-    /// State topic for the zero-export switch.
-    pub zero_export_state: String,
-    /// Command topic for the zero-export switch.
-    pub zero_export_command: String,
     /// State topic for the export-limit number.
     pub export_limit_state: String,
     /// Command topic for the export-limit number.
@@ -55,8 +51,6 @@ impl BridgeTopics {
             availability: format!("{prefix}/availability"),
             panels_state: format!("{prefix}/panels/state"),
             panels_command: format!("{prefix}/panels/command"),
-            zero_export_state: format!("{prefix}/zero_export/state"),
-            zero_export_command: format!("{prefix}/zero_export/command"),
             export_limit_state: format!("{prefix}/export_limit/state"),
             export_limit_command: format!("{prefix}/export_limit/command"),
             grid_profile_state: format!("{prefix}/grid_profile/state"),

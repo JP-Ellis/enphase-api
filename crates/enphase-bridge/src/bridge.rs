@@ -1,24 +1,30 @@
 //! The bridge's async run loop.
 //!
-//! A single long-running `tokio` task: it connects to MQTT, publishes Home
-//! Assistant discovery and availability on each (re)connection, services
-//! command topics, and publishes device state on a fixed interval. A dropped
-//! broker triggers a backoff-and-reconnect rather than a panic; an Envoy or
-//! endpoint error is logged and swallowed, never ending the loop.
+//! Two cooperating tasks run on a `LocalSet` (the library's [`Envoy`] is
+//! `!Send`): an **MQTT driver** that drives `eventloop.poll()` continuously and
+//! forwards connection events and parsed commands over an `mpsc` channel, and a
+//! **device worker** that owns the [`EnphaseControls`] and the [`StateCache`],
+//! services the channel and a poll interval, and publishes. Because device I/O
+//! lives in a different task from `poll()`, a slow Envoy can no longer starve the
+//! MQTT keep-alive. A dropped broker triggers a backoff-and-reconnect inside the
+//! driver; an Envoy or endpoint error is folded into the cache's availability,
+//! never ending the loop.
 
 use core::time::Duration;
 
-use rumqttc::{AsyncClient, ConnectionError, Event, LastWill, MqttOptions, Packet, QoS};
+use rumqttc::{AsyncClient, Event, LastWill, MqttOptions, Packet, QoS};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use enphase_api::{Credentials, Entrez, Envoy};
 
+use crate::cache::{PublishMessage, StateCache};
 use crate::cli::Args;
 use crate::controls::{EnphaseControls, EnvoyControls};
-use crate::discovery::discovery_configs;
-use crate::dispatch::handle_command;
-use crate::payload::{parse_command, state_messages};
-use crate::state::collect_state;
+use crate::discovery::{discovery_configs, zero_export_discovery_clear};
+use crate::payload::{Command, parse_command};
+use crate::state::{apply_command, poll_once};
 use crate::topics::BridgeTopics;
 
 /// The discovery node id embedded in the HA config topics.
@@ -29,11 +35,33 @@ const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// The MQTT client's in-flight request queue capacity.
 ///
-/// Sized well above the worst-case burst a single connection event or poll tick
-/// enqueues (discovery + availability + state + subscribes), because the queue
-/// is drained only by `eventloop.poll()`, which is not running while a `select!`
-/// arm body is publishing.
+/// The driver task drives `eventloop.poll()` continuously, so the queue drains
+/// even while the device worker is mid-publish; this sizing just absorbs a
+/// connection-time burst (availability + offline reset + discovery + state).
 const CLIENT_CAPACITY: usize = 256;
+/// The capacity of the driver → worker command channel.
+const COMMAND_CAPACITY: usize = 64;
+
+/// A message from the MQTT driver to the device worker.
+enum WorkerMsg {
+    /// The broker connection was (re)established.
+    Connected,
+    /// A command arrived on a command topic.
+    Command(Command),
+}
+
+/// The tunable resilience knobs the device worker runs with.
+#[derive(Debug, Clone, Copy)]
+struct ResilienceConfig {
+    /// Seconds between state polls.
+    poll_interval: u64,
+    /// Consecutive poll failures before an entity goes offline.
+    failure_threshold: u32,
+    /// Attempts per command before reverting.
+    command_retries: u32,
+    /// The export-limit `number`'s maximum, in watts.
+    export_limit_max: f64,
+}
 
 /// Compute the next reconnect backoff.
 ///
@@ -52,115 +80,111 @@ pub fn next_backoff(current: Duration) -> Duration {
     current.saturating_mul(2).min(MAX_BACKOFF)
 }
 
-/// Publish discovery and availability, and subscribe to command topics.
+/// Build the messages that reset every entity to offline on (re)connect.
 ///
-/// Runs on each (re)connection. Grid-profile options are best-effort: if the
-/// device is unreachable the discovery is published with no options rather than
-/// failing the connection.
+/// The per-entity availability topics are retained, so a reconnect after a crash
+/// would otherwise leave the stale `online` from before the crash — the
+/// reachability lie this revision forbids. Published before the first poll, which
+/// then brings the reachable entities back online.
 ///
 /// # Arguments
 ///
-/// * `client` - The connected MQTT client.
-/// * `controls` - The device controls, for reading grid-profile options.
 /// * `topics` - The bridge's topic layout.
 ///
-/// # Errors
+/// # Returns
 ///
-/// Returns an error if an MQTT publish or subscribe fails.
-async fn announce(
-    client: &AsyncClient,
-    controls: &impl EnphaseControls,
-    topics: &BridgeTopics,
-) -> anyhow::Result<()> {
-    publish_discovery(client, controls, topics).await?;
-
-    for topic in [
-        &topics.panels_command,
-        &topics.zero_export_command,
-        &topics.export_limit_command,
-        &topics.grid_profile_command,
-    ] {
-        client.subscribe(topic.clone(), QoS::AtLeastOnce).await?;
-    }
-    Ok(())
+/// The reachability-off and three per-entity-offline messages, all retained.
+#[inline]
+#[must_use]
+pub fn offline_reset_messages(topics: &BridgeTopics) -> Vec<PublishMessage> {
+    vec![
+        PublishMessage {
+            topic: topics.reachability_state.clone(),
+            payload: "OFF".to_owned(),
+            retain: true,
+        },
+        PublishMessage {
+            topic: topics.panels_availability.clone(),
+            payload: "offline".to_owned(),
+            retain: true,
+        },
+        PublishMessage {
+            topic: topics.export_limit_availability.clone(),
+            payload: "offline".to_owned(),
+            retain: true,
+        },
+        PublishMessage {
+            topic: topics.grid_profile_availability.clone(),
+            payload: "offline".to_owned(),
+            retain: true,
+        },
+    ]
 }
 
-/// Publish availability `online` and the HA discovery configs.
-///
-/// Grid-profile options are best-effort: if the device is unreachable the
-/// discovery is published with no options rather than failing. This is also run
-/// on each poll (not only at connect), so the `select` entity's options
-/// populate once the device becomes reachable even if it was down at connect.
+/// Publish a batch of messages, logging per-message failures.
 ///
 /// # Arguments
 ///
 /// * `client` - The connected MQTT client.
-/// * `controls` - The device controls, for reading grid-profile options.
+/// * `messages` - The messages to publish.
+async fn publish_all(client: &AsyncClient, messages: Vec<PublishMessage>) {
+    for message in messages {
+        if let Err(err) = client
+            .publish(
+                message.topic,
+                QoS::AtLeastOnce,
+                message.retain,
+                message.payload,
+            )
+            .await
+        {
+            warn!("publish failed: {err}");
+        }
+    }
+}
+
+/// Publish the Home Assistant discovery configs, logging failures.
+///
+/// # Arguments
+///
+/// * `client` - The connected MQTT client.
 /// * `topics` - The bridge's topic layout.
-///
-/// # Errors
-///
-/// Returns an error if an MQTT publish fails.
+/// * `profile_options` - The grid-profile ids for the `select` entity.
+/// * `export_limit_max` - The export-limit `number`'s maximum, in watts.
 async fn publish_discovery(
     client: &AsyncClient,
-    controls: &impl EnphaseControls,
     topics: &BridgeTopics,
-) -> anyhow::Result<()> {
-    client
+    profile_options: &[String],
+    export_limit_max: f64,
+) {
+    for message in discovery_configs(topics, NODE_ID, profile_options, export_limit_max) {
+        if let Err(err) = client
+            .publish(message.topic, QoS::AtLeastOnce, true, message.payload)
+            .await
+        {
+            warn!("discovery publish failed: {err}");
+        }
+    }
+}
+
+/// Publish the bridge-liveness availability, logging failures.
+///
+/// # Arguments
+///
+/// * `client` - The connected MQTT client.
+/// * `topics` - The bridge's topic layout.
+/// * `payload` - `online` or `offline`.
+async fn publish_availability(client: &AsyncClient, topics: &BridgeTopics, payload: &str) {
+    if let Err(err) = client
         .publish(
             topics.availability.clone(),
             QoS::AtLeastOnce,
             true,
-            "online",
+            payload.to_owned(),
         )
-        .await?;
-
-    let profile_options = match controls.grid_profiles().await {
-        Ok(profiles) => profiles.available,
-        Err(err) => {
-            warn!("grid profiles unavailable for discovery: {err:#}");
-            Vec::new()
-        }
-    };
-    // The configurable cap is threaded through in the Task-7 run-loop rewrite;
-    // until then the default keeps this call compiling.
-    for message in discovery_configs(
-        topics,
-        NODE_ID,
-        &profile_options,
-        crate::discovery::DEFAULT_EXPORT_LIMIT_MAX,
-    ) {
-        client
-            .publish(message.topic, QoS::AtLeastOnce, true, message.payload)
-            .await?;
-    }
-    Ok(())
-}
-
-/// Collect and publish the current device state.
-///
-/// Both collection and publishing are best-effort; failures are logged, not
-/// propagated, so one bad poll never ends the loop.
-///
-/// # Arguments
-///
-/// * `client` - The connected MQTT client.
-/// * `controls` - The device controls to read.
-/// * `topics` - The bridge's topic layout.
-async fn publish_state(
-    client: &AsyncClient,
-    controls: &impl EnphaseControls,
-    topics: &BridgeTopics,
-) {
-    match collect_state(controls).await {
-        Ok(state) => {
-            for (topic, payload) in state_messages(topics, &state) {
-                if let Err(err) = client.publish(topic, QoS::AtLeastOnce, true, payload).await {
-                    warn!("state publish failed: {err}");
-                }
-            }
-        }
-        Err(err) => warn!("state collection failed: {err:#}"),
+        .await
+    {
+        warn!("availability publish failed: {err}");
     }
 }
 
@@ -252,70 +276,222 @@ fn build_mqtt_options(args: &Args, topics: &BridgeTopics) -> MqttOptions {
     options
 }
 
-/// Handle one polled MQTT event.
+/// Complete when either `ctrl_c` (SIGINT) or SIGTERM fires.
 ///
-/// A fresh connection republishes discovery and availability; an incoming
-/// publish is parsed and dispatched; a connection error backs off and lets the
-/// event loop reconnect. Control errors are logged, never propagated.
+/// Created once and pinned for the loop's lifetime, so the signal registration is
+/// not torn down and rebuilt each iteration. If the SIGTERM handler cannot be
+/// installed, it falls back to `ctrl_c` alone.
+#[expect(
+    clippy::integer_division_remainder_used,
+    reason = "lives inside the tokio::select! macro expansion"
+)]
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            warn!("failed to listen for ctrl_c: {err}");
+        }
+    };
+    match signal(SignalKind::terminate()) {
+        Ok(mut terminate) => {
+            tokio::select! {
+                () = ctrl_c => {},
+                _ = terminate.recv() => {},
+            }
+        }
+        Err(err) => {
+            warn!("SIGTERM handler unavailable: {err}; falling back to ctrl_c only");
+            ctrl_c.await;
+        }
+    }
+}
+
+/// Drive the MQTT event loop and forward events to the device worker.
+///
+/// Loops `eventloop.poll()` without interruption so the keep-alive is never
+/// blocked by device I/O. A `ConnAck` subscribes to the command topics and
+/// signals [`WorkerMsg::Connected`]; an incoming publish is parsed and forwarded;
+/// a connection error backs off (non-blocking, since this is its own task) and
+/// lets the event loop reconnect. Returns when the worker's receiver is gone.
 ///
 /// # Arguments
 ///
-/// * `event` - The event (or error) from the MQTT event loop.
-/// * `client` - The connected MQTT client.
-/// * `controls` - The device controls.
+/// * `eventloop` - The MQTT event loop to drive.
+/// * `client` - The MQTT client, for subscribing.
 /// * `topics` - The bridge's topic layout.
-/// * `backoff` - The current reconnect backoff, updated in place.
-/// * `connected` - Whether the broker connection is established, updated in
-///   place; gates the poll-tick publishing so no publish is enqueued before the
-///   event loop can drain it.
+/// * `tx` - The channel to the device worker.
+/// * `export_limit_max` - The export-limit cap, for command validation.
 #[expect(
     clippy::cognitive_complexity,
     reason = "a flat dispatch over the event loop's packet variants"
 )]
-async fn handle_poll_event(
-    event: Result<Event, ConnectionError>,
+async fn mqtt_driver(
+    mut eventloop: rumqttc::EventLoop,
+    client: AsyncClient,
+    topics: BridgeTopics,
+    tx: mpsc::Sender<WorkerMsg>,
+    export_limit_max: f64,
+) {
+    let mut backoff = MIN_BACKOFF;
+    loop {
+        match eventloop.poll().await {
+            Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                backoff = MIN_BACKOFF;
+                info!("connected to MQTT broker; subscribing to command topics");
+                for topic in [
+                    &topics.panels_command,
+                    &topics.export_limit_command,
+                    &topics.grid_profile_command,
+                ] {
+                    if let Err(err) = client.subscribe(topic.clone(), QoS::AtLeastOnce).await {
+                        warn!("subscribe to {topic} failed: {err}");
+                    }
+                }
+                if tx.send(WorkerMsg::Connected).await.is_err() {
+                    return;
+                }
+            }
+            Ok(Event::Incoming(Packet::Publish(publish))) => {
+                if let Some(command) =
+                    parse_command(&publish.topic, &publish.payload, &topics, export_limit_max)
+                    && tx.send(WorkerMsg::Command(command)).await.is_err()
+                {
+                    return;
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                warn!("MQTT connection error: {err}; reconnecting in {backoff:?}");
+                tokio::time::sleep(backoff).await;
+                backoff = next_backoff(backoff);
+            }
+        }
+    }
+}
+
+/// Publish the full connect-time sequence: availability, offline reset, poll.
+///
+/// Brings the bridge online, resets every entity to offline (clearing stale
+/// retained `online`), clears the retired zero-export entity, performs the first
+/// poll, then republishes discovery (with any freshly-read profile options) and
+/// the cache state.
+///
+/// # Arguments
+///
+/// * `client` - The connected MQTT client.
+/// * `controls` - The device controls.
+/// * `topics` - The bridge's topic layout.
+/// * `cache` - The state cache to seed from the first poll.
+/// * `export_limit_max` - The export-limit `number`'s maximum, in watts.
+async fn on_connect(
     client: &AsyncClient,
     controls: &impl EnphaseControls,
     topics: &BridgeTopics,
-    backoff: &mut Duration,
-    connected: &mut bool,
+    cache: &mut StateCache,
+    export_limit_max: f64,
 ) {
-    match event {
-        Ok(Event::Incoming(Packet::ConnAck(_))) => {
-            *backoff = MIN_BACKOFF;
-            *connected = true;
-            info!("connected to MQTT broker; publishing discovery");
-            if let Err(err) = announce(client, controls, topics).await {
-                warn!("on-connect announce failed: {err:#}");
+    publish_availability(client, topics, "online").await;
+    publish_all(client, offline_reset_messages(topics)).await;
+    publish_all(
+        client,
+        vec![into_publish(zero_export_discovery_clear(NODE_ID))],
+    )
+    .await;
+    poll_once(controls, cache).await;
+    publish_discovery(client, topics, cache.profile_options(), export_limit_max).await;
+    publish_all(client, cache.messages(topics)).await;
+}
+
+/// Convert a discovery message into a retained [`PublishMessage`].
+///
+/// # Arguments
+///
+/// * `message` - The discovery message.
+///
+/// # Returns
+///
+/// The equivalent retained publish message.
+fn into_publish(message: crate::discovery::DiscoveryMessage) -> PublishMessage {
+    PublishMessage {
+        topic: message.topic,
+        payload: message.payload,
+        retain: true,
+    }
+}
+
+/// The device worker: own the controls and cache, service the channel and poll.
+///
+/// Runs on the `LocalSet` thread. Reacts to connection events and commands from
+/// the driver, polls on the interval, and publishes the cache's view. On a
+/// shutdown signal it publishes availability `offline` once and returns, which
+/// ends `run_until` and drops the driver.
+///
+/// # Arguments
+///
+/// * `client` - The connected MQTT client.
+/// * `controls` - The device controls (owned; `!Send`).
+/// * `topics` - The bridge's topic layout.
+/// * `rx` - The channel from the MQTT driver.
+/// * `config` - The resilience knobs (poll interval, thresholds, cap).
+#[expect(
+    clippy::integer_division_remainder_used,
+    clippy::cognitive_complexity,
+    reason = "both live inside the tokio::select! macro expansion"
+)]
+async fn device_worker(
+    client: AsyncClient,
+    controls: impl EnphaseControls,
+    topics: BridgeTopics,
+    mut rx: mpsc::Receiver<WorkerMsg>,
+    config: ResilienceConfig,
+) {
+    let mut cache = StateCache::new(config.failure_threshold);
+    let mut interval = tokio::time::interval(Duration::from_secs(config.poll_interval));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            () = &mut shutdown => {
+                info!("shutdown signal received; marking bridge offline");
+                publish_availability(&client, &topics, "offline").await;
+                return;
             }
-        }
-        Ok(Event::Incoming(Packet::Publish(publish))) => {
-            if let Some(command) = parse_command(
-                &publish.topic,
-                &publish.payload,
-                topics,
-                crate::discovery::DEFAULT_EXPORT_LIMIT_MAX,
-            ) && let Err(err) = handle_command(command, controls).await
-            {
-                warn!("command on {} failed: {err:#}", publish.topic);
+            message = rx.recv() => {
+                match message {
+                    Some(WorkerMsg::Connected) => {
+                        on_connect(&client, &controls, &topics, &mut cache, config.export_limit_max)
+                            .await;
+                    }
+                    Some(WorkerMsg::Command(command)) => {
+                        if let Err(err) =
+                            apply_command(command, &controls, &mut cache, config.command_retries)
+                                .await
+                        {
+                            warn!("command failed, reverting to last-known-good: {err:#}");
+                        }
+                        publish_all(&client, cache.messages(&topics)).await;
+                    }
+                    None => return,
+                }
             }
-        }
-        Ok(_) => {}
-        Err(err) => {
-            *connected = false;
-            warn!("MQTT connection error: {err}; reconnecting in {backoff:?}");
-            tokio::time::sleep(*backoff).await;
-            *backoff = next_backoff(*backoff);
+            _ = interval.tick() => {
+                poll_once(&controls, &mut cache).await;
+                publish_discovery(&client, &topics, cache.profile_options(), config.export_limit_max)
+                    .await;
+                publish_all(&client, cache.messages(&topics)).await;
+            }
         }
     }
 }
 
 /// Run the bridge until a shutdown signal is received.
 ///
-/// Connects to MQTT and drives the event loop: each connection republishes
-/// discovery and availability, incoming commands are dispatched to the device,
-/// and state is published on the poll interval. Connection errors back off and
-/// reconnect; control errors are logged.
+/// Connects to MQTT and runs two cooperating tasks on a `LocalSet`: a driver that
+/// keeps the event loop polled, and a worker that owns the device controls and
+/// cache. On SIGINT/SIGTERM the worker publishes availability `offline` and
+/// returns; a crash is still covered by the Last Will.
 ///
 /// # Arguments
 ///
@@ -327,60 +503,38 @@ async fn handle_poll_event(
 /// the loop starts). The run loop itself never propagates a transient error:
 /// broker, Envoy, and shutdown-publish failures are logged, not returned.
 #[inline]
-#[expect(
-    clippy::integer_division_remainder_used,
-    clippy::cognitive_complexity,
-    reason = "both live inside the tokio::select! macro expansion"
-)]
 pub async fn run(args: Args) -> anyhow::Result<()> {
     let topics = BridgeTopics::new(&args.topic_prefix);
     let controls = build_controls(&args)?;
     let options = build_mqtt_options(&args, &topics);
 
-    let (client, mut eventloop) = AsyncClient::new(options, CLIENT_CAPACITY);
+    let (client, eventloop) = AsyncClient::new(options, CLIENT_CAPACITY);
+    let (tx, rx) = mpsc::channel::<WorkerMsg>(COMMAND_CAPACITY);
 
-    let mut interval = tokio::time::interval(Duration::from_secs(args.poll_interval));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let config = ResilienceConfig {
+        poll_interval: args.poll_interval,
+        failure_threshold: args.poll_failure_threshold,
+        command_retries: args.command_retries,
+        export_limit_max: args.export_limit_max,
+    };
 
-    let mut backoff = MIN_BACKOFF;
-    let mut connected = false;
     info!("enphase-bridge starting; connecting to MQTT broker");
 
-    loop {
-        tokio::select! {
-            event = eventloop.poll() => {
-                handle_poll_event(event, &client, &controls, &topics, &mut backoff, &mut connected).await;
-            }
-            _ = interval.tick() => {
-                // Only publish while connected: publishes enqueue into a bounded
-                // channel drained solely by `poll()`, which is not running during
-                // this arm, so publishing before the connection is established can
-                // fill the channel and deadlock.
-                if connected {
-                    // Re-publish discovery (retained, idempotent) so the
-                    // grid-profile select's options populate once the device is
-                    // reachable, even if it was down at connect time.
-                    if let Err(err) = publish_discovery(&client, &controls, &topics).await {
-                        warn!("periodic discovery refresh failed: {err}");
-                    }
-                    publish_state(&client, &controls, &topics).await;
-                }
-            }
-            signal = tokio::signal::ctrl_c() => {
-                if let Err(err) = signal {
-                    warn!("failed to listen for shutdown signal: {err}");
-                }
-                info!("shutdown signal received; marking bridge offline");
-                if let Err(err) = client
-                    .publish(topics.availability.clone(), QoS::AtLeastOnce, true, "offline")
-                    .await
-                {
-                    warn!("offline-availability publish failed: {err}");
-                }
-                return Ok(());
-            }
-        }
-    }
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            tokio::task::spawn_local(mqtt_driver(
+                eventloop,
+                client.clone(),
+                topics.clone(),
+                tx,
+                config.export_limit_max,
+            ));
+            device_worker(client, controls, topics, rx, config).await;
+        })
+        .await;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -397,6 +551,26 @@ mod tests {
         assert_eq!(
             next_backoff(Duration::from_secs(40)),
             Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn offline_reset_messages_cover_all_entities() {
+        let topics = BridgeTopics::new("enphase");
+        let msgs = offline_reset_messages(&topics);
+        assert!(msgs.iter().all(|m| m.retain));
+        let found: Vec<(&str, &str)> = msgs
+            .iter()
+            .map(|m| (m.topic.as_str(), m.payload.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                (topics.reachability_state.as_str(), "OFF"),
+                (topics.panels_availability.as_str(), "offline"),
+                (topics.export_limit_availability.as_str(), "offline"),
+                (topics.grid_profile_availability.as_str(), "offline"),
+            ]
         );
     }
 }
