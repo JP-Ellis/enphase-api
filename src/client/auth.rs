@@ -31,11 +31,14 @@ pub(crate) fn load_cached_token(path: &Path) -> Option<String> {
         .filter(|token| !token.is_empty())
 }
 
-/// Write `token` to `path`, creating the file with mode `0600`.
+/// Write `token` to `path`, creating the file with mode `0600` on Unix.
 ///
-/// The token is an installer-grade credential, so the file is never
+/// The token is an installer-grade credential, so on Unix the file is never
 /// world-readable: it is created `0600` and its permissions are reasserted
-/// after writing to cover the overwrite-an-existing-file case.
+/// after writing to cover the overwrite-an-existing-file case. The bridge
+/// targets Linux; on non-Unix platforms the token is written without POSIX
+/// permission hardening (restrict the containing directory yourself if the
+/// path is shared).
 ///
 /// # Arguments
 ///
@@ -46,19 +49,26 @@ pub(crate) fn load_cached_token(path: &Path) -> Option<String> {
 ///
 /// Returns an error if the file cannot be created or written.
 pub(crate) fn save_cached_token(path: &Path, token: &str) -> Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(token.as_bytes())?;
-    // `mode` above only applies when the file is created; reassert 0600 so an
-    // overwrite of a pre-existing file is tightened too.
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(token.as_bytes())?;
+        // `mode` above only applies when the file is created; reassert 0600 so
+        // an overwrite of a pre-existing file is tightened too.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, token.as_bytes())?;
+    }
     Ok(())
 }
 
