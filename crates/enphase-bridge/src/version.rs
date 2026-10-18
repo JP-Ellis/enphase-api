@@ -13,6 +13,7 @@ use serde::Serialize;
 /// This consists of a version tuple parsed from git tags, along with optional
 /// commit information if available.
 #[derive(Debug, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct Version {
     /// The version tuple.
     ///
@@ -40,6 +41,7 @@ impl Default for Version {
     ///
     /// This function will panic if the version information cannot be parsed
     /// (due to an invalid format).
+    #[inline]
     #[expect(clippy::expect_used, reason = "Version should be set at build time.")]
     fn default() -> Self {
         // Try to get version from git tag, fallback to CARGO_PKG_VERSION
@@ -117,6 +119,7 @@ impl From<Version> for clap::builder::Str {
 
 /// Information about the git repository where the CLI was built.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct CommitInfo {
     /// Short commit hash.
     pub short_commit_hash: String,

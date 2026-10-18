@@ -20,7 +20,8 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt as _, util::Subscr
 ///     - `0`: Warn/error only.
 ///     - `1`: Info and above.
 ///     - `2` or higher: Debug and above, with timing and span events.
-pub(crate) fn setup_tracing(verbosity: u8) {
+#[inline]
+pub fn setup_tracing(verbosity: u8) {
     let filter = match verbosity {
         0 => EnvFilter::new("warn"),
         1 => EnvFilter::new("info"),
