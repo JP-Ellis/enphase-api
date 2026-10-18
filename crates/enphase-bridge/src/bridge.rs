@@ -28,7 +28,12 @@ const MIN_BACKOFF: Duration = Duration::from_secs(1);
 /// The maximum reconnect backoff.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// The MQTT client's in-flight request queue capacity.
-const CLIENT_CAPACITY: usize = 16;
+///
+/// Sized well above the worst-case burst a single connection event or poll tick
+/// enqueues (discovery + availability + state + subscribes), because the queue
+/// is drained only by `eventloop.poll()`, which is not running while a `select!`
+/// arm body is publishing.
+const CLIENT_CAPACITY: usize = 256;
 
 /// Compute the next reconnect backoff.
 ///
@@ -253,6 +258,9 @@ fn build_mqtt_options(args: &Args, topics: &BridgeTopics) -> MqttOptions {
 /// * `controls` - The device controls.
 /// * `topics` - The bridge's topic layout.
 /// * `backoff` - The current reconnect backoff, updated in place.
+/// * `connected` - Whether the broker connection is established, updated in
+///   place; gates the poll-tick publishing so no publish is enqueued before the
+///   event loop can drain it.
 #[expect(
     clippy::cognitive_complexity,
     reason = "a flat dispatch over the event loop's packet variants"
@@ -263,10 +271,12 @@ async fn handle_poll_event(
     controls: &impl EnphaseControls,
     topics: &BridgeTopics,
     backoff: &mut Duration,
+    connected: &mut bool,
 ) {
     match event {
         Ok(Event::Incoming(Packet::ConnAck(_))) => {
             *backoff = MIN_BACKOFF;
+            *connected = true;
             info!("connected to MQTT broker; publishing discovery");
             if let Err(err) = announce(client, controls, topics).await {
                 warn!("on-connect announce failed: {err:#}");
@@ -281,6 +291,7 @@ async fn handle_poll_event(
         }
         Ok(_) => {}
         Err(err) => {
+            *connected = false;
             warn!("MQTT connection error: {err}; reconnecting in {backoff:?}");
             tokio::time::sleep(*backoff).await;
             *backoff = next_backoff(*backoff);
@@ -321,21 +332,28 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut backoff = MIN_BACKOFF;
+    let mut connected = false;
     info!("enphase-bridge starting; connecting to MQTT broker");
 
     loop {
         tokio::select! {
             event = eventloop.poll() => {
-                handle_poll_event(event, &client, &controls, &topics, &mut backoff).await;
+                handle_poll_event(event, &client, &controls, &topics, &mut backoff, &mut connected).await;
             }
             _ = interval.tick() => {
-                // Re-publish discovery (retained, idempotent) so the grid-profile
-                // select's options populate once the device is reachable, even if
-                // it was down at connect time.
-                if let Err(err) = publish_discovery(&client, &controls, &topics).await {
-                    warn!("periodic discovery refresh failed: {err}");
+                // Only publish while connected: publishes enqueue into a bounded
+                // channel drained solely by `poll()`, which is not running during
+                // this arm, so publishing before the connection is established can
+                // fill the channel and deadlock.
+                if connected {
+                    // Re-publish discovery (retained, idempotent) so the
+                    // grid-profile select's options populate once the device is
+                    // reachable, even if it was down at connect time.
+                    if let Err(err) = publish_discovery(&client, &controls, &topics).await {
+                        warn!("periodic discovery refresh failed: {err}");
+                    }
+                    publish_state(&client, &controls, &topics).await;
                 }
-                publish_state(&client, &controls, &topics).await;
             }
             signal = tokio::signal::ctrl_c() => {
                 if let Err(err) = signal {
