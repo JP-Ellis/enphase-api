@@ -5,6 +5,12 @@
 
 use crate::topics::BridgeTopics;
 
+/// The maximum export limit, in watts, accepted on the command topic.
+///
+/// Mirrors the `max` the `number` discovery config advertises; keep the two in
+/// step.
+const MAX_EXPORT_LIMIT_W: f64 = 20_000.0;
+
 /// A command received from Home Assistant over an MQTT command topic.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -77,9 +83,18 @@ pub fn parse_command(topic: &str, payload: &[u8], topics: &BridgeTopics) -> Opti
         parse_switch(payload).map(Command::SetZeroExport)
     } else if topic == topics.export_limit_command {
         let text = core::str::from_utf8(payload).ok()?.trim();
-        text.parse::<f64>().ok().map(Command::SetExportLimit)
+        let watts = text.parse::<f64>().ok()?;
+        // Reject non-finite, negative, and out-of-range values (the range check
+        // also excludes NaN and infinities), matching the bounds discovery
+        // advertises, so a stray publisher cannot push a nonsense DPEL limit.
+        (0.0..=MAX_EXPORT_LIMIT_W)
+            .contains(&watts)
+            .then_some(Command::SetExportLimit(watts))
     } else if topic == topics.grid_profile_command {
-        let text = core::str::from_utf8(payload).ok()?;
+        let text = core::str::from_utf8(payload).ok()?.trim();
+        if text.is_empty() {
+            return None;
+        }
         Some(Command::SelectGridProfile(text.to_owned()))
     } else {
         None
@@ -99,6 +114,11 @@ pub fn parse_command(topic: &str, payload: &[u8], topics: &BridgeTopics) -> Opti
 ///
 /// The formatted string.
 fn format_watts(watts: f64) -> String {
+    if !watts.is_finite() {
+        // A non-finite device value would publish "NaN"/"inf", which Home
+        // Assistant's number entity cannot parse; publish a safe 0 instead.
+        return "0".to_owned();
+    }
     if watts.fract() == 0.0 {
         format!("{watts:.0}")
     } else {
@@ -189,6 +209,62 @@ mod tests {
             parse_command(&topics.export_limit_command, b"not-a-number", &topics),
             None
         );
+    }
+
+    #[test]
+    fn parse_export_limit_rejects_out_of_range_and_non_finite() {
+        let topics = BridgeTopics::new("enphase");
+        for payload in [
+            b"-5".as_slice(),
+            b"50000".as_slice(),
+            b"nan".as_slice(),
+            b"inf".as_slice(),
+        ] {
+            assert_eq!(
+                parse_command(&topics.export_limit_command, payload, &topics),
+                None,
+                "payload {payload:?} should be rejected"
+            );
+        }
+        // The boundary values are accepted.
+        assert_eq!(
+            parse_command(&topics.export_limit_command, b"0", &topics),
+            Some(Command::SetExportLimit(0.0))
+        );
+        assert_eq!(
+            parse_command(&topics.export_limit_command, b"20000", &topics),
+            Some(Command::SetExportLimit(20000.0))
+        );
+    }
+
+    #[test]
+    fn parse_select_trims_and_rejects_empty() {
+        let topics = BridgeTopics::new("enphase");
+        assert_eq!(
+            parse_command(&topics.grid_profile_command, b"  AUS_A:1.2  ", &topics),
+            Some(Command::SelectGridProfile("AUS_A:1.2".to_owned()))
+        );
+        assert_eq!(
+            parse_command(&topics.grid_profile_command, b"   ", &topics),
+            None
+        );
+    }
+
+    #[test]
+    fn format_watts_handles_non_finite() {
+        let topics = BridgeTopics::new("enphase");
+        let state = BridgeState {
+            panels_on: false,
+            zero_export_on: false,
+            export_limit_w: f64::NAN,
+            selected_profile: String::new(),
+        };
+        let msgs = state_messages(&topics, &state);
+        let export = msgs
+            .iter()
+            .find(|(topic, _)| *topic == topics.export_limit_state)
+            .expect("export-limit state message present");
+        assert_eq!(export.1, "0");
     }
 
     #[test]
