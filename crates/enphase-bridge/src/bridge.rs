@@ -14,6 +14,7 @@ use core::time::Duration;
 
 use async_trait::async_trait;
 use rumqttc::{AsyncClient, Event, LastWill, MqttOptions, Packet, QoS};
+#[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -305,6 +306,7 @@ fn build_mqtt_options(args: &Args, topics: &BridgeTopics) -> MqttOptions {
 /// Created once and pinned for the loop's lifetime, so the signal registration is
 /// not torn down and rebuilt each iteration. If the SIGTERM handler cannot be
 /// installed, it falls back to `ctrl_c` alone.
+#[cfg(unix)]
 #[expect(
     clippy::integer_division_remainder_used,
     reason = "lives inside the tokio::select! macro expansion"
@@ -326,6 +328,16 @@ async fn shutdown_signal() {
             warn!("SIGTERM handler unavailable: {err}; falling back to ctrl_c only");
             ctrl_c.await;
         }
+    }
+}
+
+/// Complete when `ctrl_c` fires.
+///
+/// The non-unix fallback: there is no SIGTERM, so only `ctrl_c` ends the loop.
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        warn!("failed to listen for ctrl_c: {err}");
     }
 }
 
