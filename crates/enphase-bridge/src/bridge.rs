@@ -67,6 +67,40 @@ async fn announce(
     controls: &impl EnphaseControls,
     topics: &BridgeTopics,
 ) -> anyhow::Result<()> {
+    publish_discovery(client, controls, topics).await?;
+
+    for topic in [
+        &topics.panels_command,
+        &topics.zero_export_command,
+        &topics.export_limit_command,
+        &topics.grid_profile_command,
+    ] {
+        client.subscribe(topic.clone(), QoS::AtLeastOnce).await?;
+    }
+    Ok(())
+}
+
+/// Publish availability `online` and the HA discovery configs.
+///
+/// Grid-profile options are best-effort: if the device is unreachable the
+/// discovery is published with no options rather than failing. This is also run
+/// on each poll (not only at connect), so the `select` entity's options
+/// populate once the device becomes reachable even if it was down at connect.
+///
+/// # Arguments
+///
+/// * `client` - The connected MQTT client.
+/// * `controls` - The device controls, for reading grid-profile options.
+/// * `topics` - The bridge's topic layout.
+///
+/// # Errors
+///
+/// Returns an error if an MQTT publish fails.
+async fn publish_discovery(
+    client: &AsyncClient,
+    controls: &impl EnphaseControls,
+    topics: &BridgeTopics,
+) -> anyhow::Result<()> {
     client
         .publish(
             topics.availability.clone(),
@@ -87,15 +121,6 @@ async fn announce(
         client
             .publish(message.topic, QoS::AtLeastOnce, true, message.payload)
             .await?;
-    }
-
-    for topic in [
-        &topics.panels_command,
-        &topics.zero_export_command,
-        &topics.export_limit_command,
-        &topics.grid_profile_command,
-    ] {
-        client.subscribe(topic.clone(), QoS::AtLeastOnce).await?;
     }
     Ok(())
 }
@@ -303,7 +328,15 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             event = eventloop.poll() => {
                 handle_poll_event(event, &client, &controls, &topics, &mut backoff).await;
             }
-            _ = interval.tick() => publish_state(&client, &controls, &topics).await,
+            _ = interval.tick() => {
+                // Re-publish discovery (retained, idempotent) so the grid-profile
+                // select's options populate once the device is reachable, even if
+                // it was down at connect time.
+                if let Err(err) = publish_discovery(&client, &controls, &topics).await {
+                    warn!("periodic discovery refresh failed: {err}");
+                }
+                publish_state(&client, &controls, &topics).await;
+            }
             signal = tokio::signal::ctrl_c() => {
                 if let Err(err) = signal {
                     warn!("failed to listen for shutdown signal: {err}");

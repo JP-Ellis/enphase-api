@@ -40,7 +40,12 @@ pub struct Args {
     pub serial_number: Option<String>,
 
     /// Whether the system is commissioned (affects token acquisition).
-    #[arg(long, env = "ENPHASE_COMMISSIONED", default_value_t = true)]
+    #[arg(
+        long,
+        env = "ENPHASE_COMMISSIONED",
+        action = clap::ArgAction::Set,
+        default_value_t = true
+    )]
     pub commissioned: bool,
 
     /// Optional path to a `0600` on-disk token cache.
@@ -120,5 +125,26 @@ mod tests {
         assert!(args.command.is_none());
         assert_eq!(args.poll_interval, 30);
         assert_eq!(args.topic_prefix, "enphase");
+    }
+
+    #[test]
+    fn commissioned_flag_accepts_false() {
+        let args = Args::try_parse_from([
+            "enphase-bridge",
+            "--username",
+            "user",
+            "--password",
+            "pass",
+            "--host",
+            "envoy.local",
+            "--site-name",
+            "Site",
+            "--serial-number",
+            "121212121212",
+            "--commissioned",
+            "false",
+        ])
+        .expect("args parse");
+        assert!(!args.commissioned);
     }
 }
