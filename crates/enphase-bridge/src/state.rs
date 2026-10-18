@@ -1,43 +1,17 @@
-//! Device state collection.
+//! Device poll and command orchestration.
 //!
-//! Reads the device controls and assembles a
-//! [`BridgeState`](crate::payload::BridgeState) for publishing.
+//! Reads the device controls and folds the results into the
+//! [`StateCache`](crate::cache::StateCache): [`poll_once`] refreshes every
+//! entity, and [`apply_command`] applies a command with retries and reconciles
+//! the cache.
 
 use tracing::warn;
 
 use crate::cache::{Entity, StateCache};
 use crate::controls::{EnphaseControls, retry};
 use crate::dispatch::handle_command;
-use crate::payload::{BridgeState, Command};
+use crate::payload::Command;
 use crate::reachability::{Reachability, classify};
-
-/// Collect the current device state for publishing.
-///
-/// The zero-export switch reports on whenever DPEL export limiting is enabled,
-/// regardless of the watt value; the export-limit number carries the actual
-/// limit.
-///
-/// # Arguments
-///
-/// * `controls` - The device controls to read from.
-///
-/// # Errors
-///
-/// Returns any error surfaced by reading panel, export-limit, or grid-profile
-/// state.
-#[inline]
-pub async fn collect_state(controls: &impl EnphaseControls) -> anyhow::Result<BridgeState> {
-    let panels_on = controls.panels_state().await?;
-    let export_limit = controls.export_limit_state().await?;
-    let grid_profiles = controls.grid_profiles().await?;
-
-    Ok(BridgeState {
-        panels_on,
-        zero_export_on: export_limit.enabled,
-        export_limit_w: export_limit.limit_w,
-        selected_profile: grid_profiles.selected_id,
-    })
-}
 
 /// Classify a read failure and update the cache accordingly.
 ///
@@ -186,11 +160,9 @@ mod tests {
     use super::*;
 
     use crate::cache::StateCache;
-    use crate::controls::{ExportLimit, GridProfiles, MockEnphaseControls};
-    use crate::payload::{BridgeState, Command};
+    use crate::controls::{ExportLimit, MockEnphaseControls};
+    use crate::payload::Command;
     use crate::topics::BridgeTopics;
-
-    use pretty_assertions::assert_eq;
 
     #[tokio::test]
     async fn poll_once_marks_only_failed_entity_unavailable() {
@@ -259,35 +231,5 @@ mod tests {
             msgs.iter()
                 .any(|m| m.topic == topics.export_limit_state && m.payload == "0")
         ); // last-known-good
-    }
-
-    #[tokio::test]
-    async fn collect_state_maps_controls() {
-        let mut mock = MockEnphaseControls::new();
-        mock.expect_panels_state().returning(|| Ok(true));
-        mock.expect_export_limit_state().returning(|| {
-            Ok(ExportLimit {
-                enabled: true,
-                limit_w: 0.0,
-            })
-        });
-        mock.expect_grid_profiles().returning(|| {
-            Ok(GridProfiles {
-                selected_id: "AUS_A:1.2".to_owned(),
-                available: vec![],
-            })
-        });
-
-        let state = collect_state(&mock).await.expect("collect_state succeeds");
-
-        assert_eq!(
-            state,
-            BridgeState {
-                panels_on: true,
-                zero_export_on: true,
-                export_limit_w: 0.0,
-                selected_profile: "AUS_A:1.2".to_owned(),
-            }
-        );
     }
 }
