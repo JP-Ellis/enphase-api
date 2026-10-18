@@ -60,7 +60,9 @@ pub fn classify(error: &anyhow::Error) -> Reachability {
 /// failure; [`Reachability::Reachable`] once a response (including an error
 /// status) was received.
 fn classify_http(re: &reqwest::Error) -> Reachability {
-    if re.is_connect() || re.is_timeout() || (re.is_request() && !re.is_status()) {
+    // A request-kind error is one that never got a response, so it is a distinct
+    // kind from a status error — no `!is_status()` guard is needed alongside it.
+    if re.is_connect() || re.is_timeout() || re.is_request() {
         Reachability::Unreachable
     } else {
         Reachability::Reachable

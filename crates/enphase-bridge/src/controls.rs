@@ -75,8 +75,9 @@ where
     F: Fn() -> Fut,
     Fut: Future<Output = anyhow::Result<T>>,
 {
-    // The loop runs at least once, so a sentinel that is never returned keeps
-    // this allocation-free and expect-free; every failing attempt overwrites it.
+    // The loop runs at least once and every failing attempt overwrites this
+    // sentinel, so it is never returned; it exists only to avoid an `expect` on
+    // the "zero attempts" path that `attempts.max(1)` already rules out.
     let mut last_error = anyhow::anyhow!("retry ran no attempts");
     for _ in 0..attempts.max(1) {
         match operation().await {
@@ -195,9 +196,12 @@ impl EnphaseControls for EnvoyControls {
             warn!("no inverters enumerated; panels command had no effect");
         }
 
-        // Attempt every inverter (retrying each once) so a single bad inverter
-        // does not leave the rest of the array untouched; surface the first
-        // persistent failure.
+        // Attempt every inverter, retrying each once here so a single flaky
+        // inverter does not leave the rest of the array untouched; surface the
+        // first persistent failure. The caller (`apply_command`) additionally
+        // re-runs the whole call up to `--command-retries` times, so the two
+        // layers compound: this one heals a lone inverter without redoing the
+        // array, the outer one re-attempts the array as a unit.
         let mut first_error: Option<anyhow::Error> = None;
         for serial in serials {
             let outcome = retry(2, || async {
