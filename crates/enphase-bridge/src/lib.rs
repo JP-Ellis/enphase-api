@@ -26,10 +26,10 @@ pub mod logging;
 pub mod version;
 
 pub use cache::{Entity, PublishMessage, StateCache};
-pub use controls::{EnphaseControls, EnvoyControls, ExportLimit, GridProfiles, quorum_on};
+pub use controls::{EnphaseControls, EnvoyControls, ExportLimit, GridProfiles, quorum_on, retry};
 pub use discovery::{DiscoveryMessage, discovery_configs, zero_export_discovery_clear};
 pub use dispatch::handle_command;
 pub use payload::{BridgeState, Command, parse_command, state_messages};
 pub use reachability::{Reachability, classify};
-pub use state::collect_state;
+pub use state::{apply_command, collect_state, poll_once};
 pub use topics::BridgeTopics;
