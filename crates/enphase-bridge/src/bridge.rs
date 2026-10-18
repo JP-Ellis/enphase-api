@@ -455,6 +455,13 @@ async fn device_worker(
         tokio::select! {
             () = &mut shutdown => {
                 info!("shutdown signal received; marking bridge offline");
+                // The authoritative offline signal is the Last Will: returning
+                // here ends `run_until`, drops the driver, and closes the socket
+                // without a DISCONNECT, so the broker fires the retained LWT. This
+                // enqueued publish is a best-effort redundancy and may not flush
+                // before the driver is dropped. Anything that later sends a
+                // graceful DISCONNECT would suppress the LWT and must drain this
+                // publish itself first.
                 publish_availability(&client, &topics, "offline").await;
                 return;
             }

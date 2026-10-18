@@ -91,6 +91,8 @@ pub struct StateCache {
     grid_profile: EntityState<String>,
     /// The grid-profile ids available on the device, for discovery refresh.
     profile_options: Vec<String>,
+    /// Consecutive connection-level (unreachable) polls since the last contact.
+    consecutive_unreachable: u32,
 }
 
 impl StateCache {
@@ -115,6 +117,7 @@ impl StateCache {
             export_limit: EntityState::new(),
             grid_profile: EntityState::new(),
             profile_options: Vec::new(),
+            consecutive_unreachable: 0,
         }
     }
 
@@ -168,10 +171,27 @@ impl StateCache {
         }
     }
 
+    /// Record a connection-level (unreachable) poll, debounced like per-entity
+    /// failures.
+    ///
+    /// A one-off unreachable poll (a Wi-Fi hiccup, a momentarily busy Envoy)
+    /// leaves the last-known-good state visible with no change in Home Assistant;
+    /// only `failure_threshold` consecutive unreachable polls flip the whole
+    /// device offline. This keeps a single transient blip from flapping every
+    /// entity — the design's flapping anti-goal.
+    #[inline]
+    pub fn record_unreachable(&mut self) {
+        self.consecutive_unreachable = self.consecutive_unreachable.saturating_add(1);
+        if self.consecutive_unreachable >= self.failure_threshold {
+            self.mark_unreachable();
+        }
+    }
+
     /// Mark the Envoy unreachable: reachability off, every entity unavailable.
     ///
     /// Cached values are left untouched so the last-known-good state is still
-    /// available to republish once the box returns.
+    /// available to republish once the box returns. This is the immediate
+    /// transition; [`record_unreachable`](Self::record_unreachable) debounces it.
     #[inline]
     pub fn mark_unreachable(&mut self) {
         self.reachable = false;
@@ -183,10 +203,12 @@ impl StateCache {
     /// Mark the Envoy reachable at the connection level.
     ///
     /// Per-entity availability is still governed by each entity's own successes
-    /// and failures; this only lifts the connection-level flag.
+    /// and failures; this lifts the connection-level flag and resets the
+    /// consecutive-unreachable counter, so recovery clears the debounce.
     #[inline]
     pub fn mark_reachable(&mut self) {
         self.reachable = true;
+        self.consecutive_unreachable = 0;
     }
 
     /// The grid-profile ids available on the device.
@@ -351,6 +373,59 @@ mod tests {
         assert!(
             msgs.iter()
                 .any(|m| m.topic == topics.panels_availability && m.payload == "online")
+        );
+    }
+
+    #[test]
+    fn single_unreachable_does_not_flap() {
+        let topics = BridgeTopics::new("enphase");
+        let mut cache = StateCache::new(3);
+        cache.mark_reachable();
+        cache.record_panels(true);
+        cache.record_unreachable(); // 1 of 3 — a transient blip
+        let msgs = cache.messages(&topics);
+        assert!(
+            msgs.iter()
+                .any(|m| m.topic == topics.reachability_state && m.payload == "ON")
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.topic == topics.panels_availability && m.payload == "online")
+        );
+    }
+
+    #[test]
+    fn sustained_unreachable_drops_everything() {
+        let topics = BridgeTopics::new("enphase");
+        let mut cache = StateCache::new(2);
+        cache.mark_reachable();
+        cache.record_panels(true);
+        cache.record_unreachable();
+        cache.record_unreachable(); // reaches the threshold
+        let msgs = cache.messages(&topics);
+        assert!(
+            msgs.iter()
+                .any(|m| m.topic == topics.reachability_state && m.payload == "OFF")
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.topic == topics.panels_availability && m.payload == "offline")
+        );
+    }
+
+    #[test]
+    fn reachable_contact_resets_the_unreachable_counter() {
+        let topics = BridgeTopics::new("enphase");
+        let mut cache = StateCache::new(2);
+        cache.mark_reachable();
+        cache.record_panels(true);
+        cache.record_unreachable(); // 1 of 2
+        cache.mark_reachable(); // a success resets the counter
+        cache.record_unreachable(); // 1 of 2 again, not 2
+        let msgs = cache.messages(&topics);
+        assert!(
+            msgs.iter()
+                .any(|m| m.topic == topics.reachability_state && m.payload == "ON")
         );
     }
 
