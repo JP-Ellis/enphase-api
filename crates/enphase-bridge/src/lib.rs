@@ -12,10 +12,12 @@
 #![expect(clippy::pub_use, reason = "Root API re-exports for convenience")]
 
 mod discovery;
+mod payload;
 mod topics;
 
 pub mod logging;
 pub mod version;
 
 pub use discovery::{DiscoveryMessage, discovery_configs};
+pub use payload::{BridgeState, Command, parse_command, state_messages};
 pub use topics::BridgeTopics;
