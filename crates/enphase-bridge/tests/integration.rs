@@ -6,7 +6,10 @@
 #![cfg(test)]
 
 use enphase_api::{Credentials, Entrez, Envoy};
-use enphase_bridge::{EnphaseControls as _, EnvoyControls, Reachability, classify};
+use enphase_bridge::{
+    BridgeTopics, EnphaseControls as _, EnvoyControls, Reachability, StateCache, classify,
+    poll_once,
+};
 
 use pretty_assertions::assert_eq;
 
@@ -52,4 +55,31 @@ async fn classify_connection_error_is_unreachable() {
         .await
         .expect_err("connection to 127.0.0.1:1 is refused");
     assert_eq!(classify(&err.into()), Reachability::Unreachable);
+}
+
+/// An unreachable Envoy drives the whole cache offline through `poll_once`.
+///
+/// Points the real controls at a refused socket and confirms `poll_once` marks
+/// reachability off. This exercises the connection-level branch end to end,
+/// which cannot be unit-tested because `reqwest::Error` has no public constructor.
+#[tokio::test]
+#[ignore = "hits an unreachable host"]
+async fn poll_once_unreachable_drops_everything() {
+    let controls = EnvoyControls::new(Envoy::new("127.0.0.1:1"));
+    let mut cache = StateCache::new(1);
+    cache.mark_reachable();
+    poll_once(&controls, &mut cache).await;
+
+    let topics = BridgeTopics::new("enphase");
+    let msgs = cache.messages(&topics);
+    let reachability = msgs
+        .iter()
+        .find(|m| m.topic == topics.reachability_state)
+        .expect("reachability message present");
+    assert_eq!(reachability.payload, "OFF");
+    let panels = msgs
+        .iter()
+        .find(|m| m.topic == topics.panels_availability)
+        .expect("panels availability present");
+    assert_eq!(panels.payload, "offline");
 }

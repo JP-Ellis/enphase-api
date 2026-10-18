@@ -51,32 +51,40 @@ pub fn quorum_on(states: &[bool]) -> bool {
     !states.is_empty() && states.iter().all(|&state| state)
 }
 
-/// Run an async operation, retrying it once if the first attempt fails.
+/// Run an async operation, retrying it up to `attempts` times.
 ///
-/// Addresses the documented "an inverter sometimes stays off, retry" case: a
-/// single transient failure is absorbed; a persistent one surfaces the second
-/// error.
+/// Absorbs a transient failure (the documented "an inverter sometimes stays off,
+/// retry" case) and surfaces the last error when every attempt fails. A zero
+/// `attempts` still runs the operation once.
 ///
 /// # Arguments
 ///
-/// * `operation` - The operation to run; it may be called twice.
+/// * `attempts` - The maximum number of attempts (treated as at least 1).
+/// * `operation` - The operation to run; it may be called up to `attempts` times.
 ///
 /// # Returns
 ///
-/// The first success, or the error from the second attempt.
+/// The first success, or the error from the final attempt.
 ///
 /// # Errors
 ///
-/// Returns the second attempt's error when both attempts fail.
-async fn retry_once<T, F, Fut>(operation: F) -> anyhow::Result<T>
+/// Returns the last attempt's error when every attempt fails.
+#[inline]
+pub async fn retry<T, F, Fut>(attempts: u32, operation: F) -> anyhow::Result<T>
 where
     F: Fn() -> Fut,
     Fut: Future<Output = anyhow::Result<T>>,
 {
-    if let Ok(value) = operation().await {
-        return Ok(value);
+    // The loop runs at least once, so a sentinel that is never returned keeps
+    // this allocation-free and expect-free; every failing attempt overwrites it.
+    let mut last_error = anyhow::anyhow!("retry ran no attempts");
+    for _ in 0..attempts.max(1) {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) => last_error = error,
+        }
     }
-    operation().await
+    Err(last_error)
 }
 
 /// The Enphase operations the bridge issues against the gateway.
@@ -192,7 +200,7 @@ impl EnphaseControls for EnvoyControls {
         // persistent failure.
         let mut first_error: Option<anyhow::Error> = None;
         for serial in serials {
-            let outcome = retry_once(|| async {
+            let outcome = retry(2, || async {
                 self.envoy.set_power_state(&serial, state).await?;
                 Ok(())
             })
@@ -284,33 +292,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_once_succeeds_on_second_attempt() {
+    async fn retry_succeeds_on_a_later_attempt() {
         use core::sync::atomic::{AtomicU32, Ordering};
 
         let calls = AtomicU32::new(0);
-        let result = retry_once(|| async {
-            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                anyhow::bail!("first attempt fails");
+        let result = retry(3, || async {
+            if calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                anyhow::bail!("early attempt fails");
             }
             Ok(42_u32)
         })
         .await;
         assert_eq!(result.expect("retry succeeds"), 42);
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
-    async fn retry_once_fails_after_two_attempts() {
+    async fn retry_fails_after_all_attempts() {
         use core::sync::atomic::{AtomicU32, Ordering};
 
         let calls = AtomicU32::new(0);
-        let result: anyhow::Result<u32> = retry_once(|| async {
+        let result: anyhow::Result<u32> = retry(2, || async {
             calls.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("always fails")
         })
         .await;
-        let _err = result.expect_err("both attempts fail");
+        let _err = result.expect_err("all attempts fail");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_runs_at_least_once_for_zero_attempts() {
+        use core::sync::atomic::{AtomicU32, Ordering};
+
+        let calls = AtomicU32::new(0);
+        let result = retry(0, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(7_u32)
+        })
+        .await;
+        assert_eq!(result.expect("retry succeeds"), 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
