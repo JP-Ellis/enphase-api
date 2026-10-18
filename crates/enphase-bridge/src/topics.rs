@@ -28,6 +28,14 @@ pub struct BridgeTopics {
     pub grid_profile_state: String,
     /// Command topic for the grid-profile select.
     pub grid_profile_command: String,
+    /// Per-entity availability topic for the panels switch.
+    pub panels_availability: String,
+    /// Per-entity availability topic for the export-limit number.
+    pub export_limit_availability: String,
+    /// Per-entity availability topic for the grid-profile select.
+    pub grid_profile_availability: String,
+    /// State topic for the connection-level reachability sensor.
+    pub reachability_state: String,
 }
 
 impl BridgeTopics {
@@ -53,6 +61,10 @@ impl BridgeTopics {
             export_limit_command: format!("{prefix}/export_limit/command"),
             grid_profile_state: format!("{prefix}/grid_profile/state"),
             grid_profile_command: format!("{prefix}/grid_profile/command"),
+            panels_availability: format!("{prefix}/panels/availability"),
+            export_limit_availability: format!("{prefix}/export_limit/availability"),
+            grid_profile_availability: format!("{prefix}/grid_profile/availability"),
+            reachability_state: format!("{prefix}/reachability/state"),
         }
     }
 }
@@ -70,5 +82,15 @@ mod tests {
         assert_eq!(topics.availability, "enphase/availability");
         assert_eq!(topics.export_limit_state, "enphase/export_limit/state");
         assert_eq!(topics.grid_profile_command, "enphase/grid_profile/command");
+        assert_eq!(topics.panels_availability, "enphase/panels/availability");
+        assert_eq!(
+            topics.export_limit_availability,
+            "enphase/export_limit/availability"
+        );
+        assert_eq!(
+            topics.grid_profile_availability,
+            "enphase/grid_profile/availability"
+        );
+        assert_eq!(topics.reachability_state, "enphase/reachability/state");
     }
 }
