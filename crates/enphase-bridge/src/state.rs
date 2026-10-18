@@ -31,7 +31,7 @@ use crate::reachability::{Reachability, classify};
 fn handle_read_failure(cache: &mut StateCache, entity: Entity, error: &anyhow::Error) -> bool {
     match classify(error) {
         Reachability::Unreachable => {
-            cache.mark_unreachable();
+            cache.record_unreachable();
             true
         }
         Reachability::Reachable => {
