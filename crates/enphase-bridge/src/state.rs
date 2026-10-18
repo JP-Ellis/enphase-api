@@ -5,7 +5,7 @@
 //! entity, and [`apply_command`] applies a command with retries and reconciles
 //! the cache.
 
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::cache::{Entity, StateCache};
 use crate::controls::{EnphaseControls, retry};
@@ -13,11 +13,12 @@ use crate::dispatch::handle_command;
 use crate::payload::Command;
 use crate::reachability::{Reachability, classify};
 
-/// Classify a read failure and update the cache accordingly.
+/// Classify a read failure, log it, and update the cache accordingly.
 ///
-/// A connection-level (unreachable) failure marks the whole cache unreachable; a
-/// failure against a box that answered marks only the one entity as failed and
-/// confirms reachability.
+/// A connection-level (unreachable) failure records a debounced unreachable poll;
+/// a failure against a box that answered marks only the one entity as failed and
+/// confirms reachability. Either way the error is logged, so a persistent read
+/// failure leaves a journal trace rather than only a silently offline entity.
 ///
 /// # Arguments
 ///
@@ -31,10 +32,12 @@ use crate::reachability::{Reachability, classify};
 fn handle_read_failure(cache: &mut StateCache, entity: Entity, error: &anyhow::Error) -> bool {
     match classify(error) {
         Reachability::Unreachable => {
+            warn!("Envoy unreachable while reading {entity:?}: {error:#}");
             cache.record_unreachable();
             true
         }
         Reachability::Reachable => {
+            warn!("read of {entity:?} failed (Envoy reachable): {error:#}");
             cache.mark_reachable();
             cache.record_failure(entity);
             false
@@ -45,9 +48,10 @@ fn handle_read_failure(cache: &mut StateCache, entity: Entity, error: &anyhow::E
 /// Poll every entity once and fold the results into the cache.
 ///
 /// Reads panels, export-limit, and grid-profiles in turn. A connection-level
-/// failure on any read marks the whole cache unreachable and stops the poll; any
-/// other outcome confirms reachability, recording a success or a per-entity
-/// failure. Nothing is published here — the caller publishes `cache.messages()`.
+/// failure on any read records a debounced unreachable poll and stops the poll
+/// early; any other outcome confirms reachability, recording a success or a
+/// per-entity failure. Nothing is published here — the caller publishes
+/// `cache.messages()`.
 ///
 /// # Arguments
 ///
@@ -70,6 +74,9 @@ pub async fn poll_once(controls: &impl EnphaseControls, cache: &mut StateCache) 
     match controls.export_limit_state().await {
         Ok(limit) => {
             cache.mark_reachable();
+            if !limit.enabled {
+                info!("DPEL disabled on the Envoy; publishing export limit as unknown");
+            }
             cache.record_export_limit(limit);
         }
         Err(error) => {
@@ -84,7 +91,11 @@ pub async fn poll_once(controls: &impl EnphaseControls, cache: &mut StateCache) 
             cache.mark_reachable();
             cache.record_grid_profile(profiles.selected_id, profiles.available);
         }
-        Err(error) => if handle_read_failure(cache, Entity::GridProfile, &error) {},
+        // The grid-profile read is the last one, so an unreachable result has
+        // nothing left to abort; record it and fall through to return.
+        Err(error) => {
+            handle_read_failure(cache, Entity::GridProfile, &error);
+        }
     }
 }
 
@@ -119,6 +130,9 @@ pub async fn apply_command(
     command_retries: u32,
 ) -> anyhow::Result<()> {
     retry(command_retries, || handle_command(cmd.clone(), controls)).await?;
+    // The device accepted the command, which proves it is reachable; lift the
+    // connection-level flag before the read-back reconciles per-entity state.
+    cache.mark_reachable();
 
     match cmd {
         Command::SetPanels(on) => match controls.panels_state().await {
@@ -164,6 +178,8 @@ mod tests {
     use crate::payload::Command;
     use crate::topics::BridgeTopics;
 
+    use pretty_assertions::assert_eq;
+
     #[tokio::test]
     async fn poll_once_marks_only_failed_entity_unavailable() {
         let mut mock = MockEnphaseControls::new();
@@ -208,6 +224,108 @@ mod tests {
         assert!(
             msgs.iter()
                 .any(|m| m.topic == topics.export_limit_state && m.payload == "5000")
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_command_marks_reachable_on_success() {
+        let mut mock = MockEnphaseControls::new();
+        mock.expect_set_export_limit().returning(|_| Ok(()));
+        mock.expect_export_limit_state().returning(|| {
+            Ok(ExportLimit {
+                enabled: true,
+                limit_w: 5000.0,
+            })
+        });
+        // The cache starts unreachable; a command the device accepts proves it is
+        // reachable again, so reachability must come back ON.
+        let mut cache = StateCache::new(3);
+        apply_command(Command::SetExportLimit(5000.0), &mock, &mut cache, 2)
+            .await
+            .expect("ok");
+        let topics = BridgeTopics::new("enphase");
+        let msgs = cache.messages(&topics);
+        assert!(
+            msgs.iter()
+                .any(|m| m.topic == topics.reachability_state && m.payload == "ON")
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_command_panels_caches_commanded_value_when_readback_fails() {
+        let mut mock = MockEnphaseControls::new();
+        mock.expect_set_panels().returning(|_| Ok(()));
+        mock.expect_panels_state()
+            .returning(|| Err(anyhow::anyhow!("read-back blip")));
+        let mut cache = StateCache::new(3);
+        cache.mark_reachable();
+        apply_command(Command::SetPanels(true), &mock, &mut cache, 2)
+            .await
+            .expect("ok");
+        let topics = BridgeTopics::new("enphase");
+        let msgs = cache.messages(&topics);
+        assert!(
+            msgs.iter()
+                .any(|m| m.topic == topics.panels_state && m.payload == "ON")
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_command_profile_readback_fail_preserves_options() {
+        let mut mock = MockEnphaseControls::new();
+        mock.expect_select_grid_profile().returning(|_| Ok(()));
+        mock.expect_grid_profiles()
+            .returning(|| Err(anyhow::anyhow!("index.json blip")));
+        let mut cache = StateCache::new(3);
+        cache.mark_reachable();
+        // A prior successful read seeded the available profile options; a failed
+        // read-back must cache the commanded id without discarding those options.
+        cache.record_grid_profile(
+            "AUS_A:1.1".to_owned(),
+            vec!["AUS_A:1.1".to_owned(), "AUS_A:1.2".to_owned()],
+        );
+        apply_command(
+            Command::SelectGridProfile("AUS_A:1.2".to_owned()),
+            &mock,
+            &mut cache,
+            2,
+        )
+        .await
+        .expect("ok");
+        let topics = BridgeTopics::new("enphase");
+        let msgs = cache.messages(&topics);
+        assert!(
+            msgs.iter()
+                .any(|m| m.topic == topics.grid_profile_state && m.payload == "AUS_A:1.2")
+        );
+        assert_eq!(
+            cache.profile_options(),
+            ["AUS_A:1.1".to_owned(), "AUS_A:1.2".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_command_caches_read_back_value_on_success() {
+        let mut mock = MockEnphaseControls::new();
+        mock.expect_set_export_limit().returning(|_| Ok(()));
+        // The device reports a different value than commanded; the read-back, not
+        // the commanded value, is what the cache keeps.
+        mock.expect_export_limit_state().returning(|| {
+            Ok(ExportLimit {
+                enabled: true,
+                limit_w: 4000.0,
+            })
+        });
+        let mut cache = StateCache::new(3);
+        cache.mark_reachable();
+        apply_command(Command::SetExportLimit(5000.0), &mock, &mut cache, 2)
+            .await
+            .expect("ok");
+        let topics = BridgeTopics::new("enphase");
+        let msgs = cache.messages(&topics);
+        assert!(
+            msgs.iter()
+                .any(|m| m.topic == topics.export_limit_state && m.payload == "4000")
         );
     }
 

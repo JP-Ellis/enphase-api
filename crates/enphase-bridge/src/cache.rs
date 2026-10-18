@@ -13,8 +13,8 @@ use crate::topics::BridgeTopics;
 /// The payload Home Assistant's MQTT `number` reads as "unknown".
 ///
 /// Published for the export-limit entity when DPEL is disabled or never read, so
-/// Home Assistant shows unknown rather than a false cap. Confirm against HA's
-/// current MQTT `number` schema (flagged for the Task-7 review hand-off).
+/// Home Assistant shows unknown rather than a false cap. HA's MQTT `number`
+/// schema treats `"None"` as the unknown state.
 const UNKNOWN_TOKEN: &str = "None";
 
 /// A retained-or-not MQTT message the bridge should publish.
@@ -70,9 +70,15 @@ impl<T> EntityState<T> {
     }
 
     /// Record a failed read: bump the counter, go unavailable at the threshold.
+    ///
+    /// A failure never *raises* availability: an entity that was never read (or was
+    /// dropped by an unreachable Envoy) stays offline. Only an entity that is
+    /// already available falls offline, and only once the threshold is reached.
     fn record_failure(&mut self, failure_threshold: u32) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        self.available = self.consecutive_failures < failure_threshold;
+        if self.consecutive_failures >= failure_threshold {
+            self.available = false;
+        }
     }
 }
 
@@ -319,7 +325,7 @@ fn export_limit_payload(limit: Option<&ExportLimit>) -> String {
 mod tests {
     use super::*;
 
-    use pretty_assertions::assert_ne;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn first_success_makes_entity_available_with_value() {
@@ -461,6 +467,22 @@ mod tests {
             .iter()
             .find(|m| m.topic == topics.export_limit_state)
             .expect("export state");
-        assert_ne!(state.payload, "5000"); // must not publish the stale cap as if enforced
+        // Disabled DPEL publishes the unknown token, not the stale cap as if enforced.
+        assert_eq!(state.payload, UNKNOWN_TOKEN);
+    }
+
+    #[test]
+    fn failure_on_never_read_entity_stays_offline() {
+        let topics = BridgeTopics::new("enphase");
+        let mut cache = StateCache::new(3);
+        cache.mark_reachable();
+        // The entity has never produced a value; a single failed read must not
+        // flip it online with no state behind it.
+        cache.record_failure(Entity::Panels);
+        let msgs = cache.messages(&topics);
+        assert!(
+            msgs.iter()
+                .any(|m| m.topic == topics.panels_availability && m.payload == "offline")
+        );
     }
 }
