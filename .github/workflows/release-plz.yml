@@ -31,7 +31,7 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30  # v2.0.1
 
       - name: Run release-plz
         uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b  # v0.5.148
@@ -65,7 +65,7 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
 
       - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30  # v2.0.1
 
       - name: Get crates.io token
         uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9  # v1.0.6
