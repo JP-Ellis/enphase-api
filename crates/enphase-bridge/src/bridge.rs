@@ -324,10 +324,6 @@ fn build_mqtt_options(args: &Args, topics: &BridgeTopics) -> MqttOptions {
 /// not torn down and rebuilt each iteration. If the SIGTERM handler cannot be
 /// installed, it falls back to `ctrl_c` alone.
 #[cfg(unix)]
-#[expect(
-    clippy::integer_division_remainder_used,
-    reason = "lives inside the tokio::select! macro expansion"
-)]
 async fn shutdown_signal() {
     let ctrl_c = async {
         if let Err(err) = tokio::signal::ctrl_c().await {
@@ -663,10 +659,6 @@ async fn handle_worker_msg(
 /// # Errors
 ///
 /// Returns an error if the MQTT driver task ends before a shutdown signal.
-#[expect(
-    clippy::integer_division_remainder_used,
-    reason = "lives inside the tokio::select! macro expansion"
-)]
 async fn device_worker(
     client: impl MqttClient,
     controls: impl EnphaseControls,
