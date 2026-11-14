@@ -12,6 +12,37 @@ categories  = ["api-bindings"]
 
 edition = "2024"
 
+[dependencies]
+reqwest    = { version = "0.13", default-features = false, features = [
+  "cookies",
+  "form",
+  "json",
+  "multipart",
+  "rustls",
+] }
+serde      = { version = "~1", default-features = false, features = ["derive"] }
+serde_json = "~1"
+thiserror  = "~2"
+tokio      = { version = "1", default-features = false, features = ["time"] }
+tracing    = { version = "0.1.41", default-features = false, features = [
+  "attributes",
+  "log",
+] }
+
+[dev-dependencies]
+anyhow            = "=1.0.104"
+insta             = "=1.49.0"
+pretty_assertions = "=1.4.1"
+rstest            = "=0.28.0"
+tokio             = { version = "=1.54.1", features = [
+  "macros",
+  "rt-multi-thread"
+] }
+wiremock          = "=0.6.5"
+
+[lints]
+workspace = true
+
 [workspace]
 resolver = "2"
 members  = ["crates/enphase-bridge"]
@@ -63,34 +94,3 @@ members  = ["crates/enphase-bridge"]
 
     [workspace.lints.rustdoc]
     missing_crate_level_docs = "warn"
-
-[dependencies]
-reqwest    = { version = "0.13", default-features = false, features = [
-  "cookies",
-  "form",
-  "json",
-  "multipart",
-  "rustls",
-] }
-serde      = { version = "~1", default-features = false, features = ["derive"] }
-serde_json = "~1"
-thiserror  = "~2"
-tokio      = { version = "1", default-features = false, features = ["time"] }
-tracing    = { version = "0.1.41", default-features = false, features = [
-  "attributes",
-  "log",
-] }
-
-[dev-dependencies]
-anyhow            = "=1.0.104"
-insta             = "=1.49.0"
-pretty_assertions = "=1.4.1"
-rstest            = "=0.28.0"
-tokio             = { version = "=1.54.1", features = [
-  "macros",
-  "rt-multi-thread"
-] }
-wiremock          = "=0.6.5"
-
-[lints]
-workspace = true
