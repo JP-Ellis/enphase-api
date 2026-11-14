@@ -120,7 +120,7 @@ struct ResilienceConfig {
 
 /// Compute the next reconnect backoff.
 ///
-/// Doubles the current backoff, capped at [`MAX_BACKOFF`].
+/// Doubles the current backoff, capped at `MAX_BACKOFF`.
 ///
 /// # Arguments
 ///
