@@ -30,7 +30,7 @@ tracing    = { version = "0.1.41", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-anyhow            = "=1.0.104"
+anyhow            = "=1.0.105"
 insta             = "=1.49.0"
 pretty_assertions = "=1.4.1"
 rstest            = "=0.29.0"
